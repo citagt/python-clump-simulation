@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 visualization_output/
 tex_report/
+documents_personal/
