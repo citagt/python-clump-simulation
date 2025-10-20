@@ -1,6 +1,7 @@
 .venv/
 __pycache__/
 *.pyc
+output/
 visualization_output/
 tex_report/
 documents_personal/
