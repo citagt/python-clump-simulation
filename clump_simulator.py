@@ -1,38 +1,52 @@
 """
 ================================================================================
-CluMP Simulator - 論文完全準拠版
+CluMP Simulator - 論文完全準拠版 (改訂版)
 ================================================================================
 
 【論文準拠性の根拠】
-本シミュレータは以下の論文記述に完全に基づいています：
+本シミュレータは論文 "CluMP: Clustered Markov Chain for Prefetching in 
+Storage I/O" (Jung et al.) に完全準拠しています。
 
-1. MCRow構造 (Section 3.3)
-   - 6フィールド: CN1, CN2, CN3, P1, P2, P3
-   - CN1-CN3: 次にアクセスされる可能性が高いチャンク番号
-   - P1-P3: 対応するチャンクへのアクセス頻度（カウンタ）
+■ Section 3.2 - クラスタ化MCの構造
+  - チャンク: ディスクブロックのセット（CH_size ブロック/チャンク）
+  - クラスタ: MCフラグメントのセット（CL_size チャンク/クラスタ）
+  - 動的管理: アクセスされたチャンクのみMCRowを作成（多段ページテーブル方式）
 
-2. 更新アルゴリズム (Section 3.3)
-   - 各I/Oアクセスごとに頻度を+1
-   - 頻度順でソート（P1が常に最大）
-   - 新規チャンクはCN3に追加、P3=1で初期化
+■ Section 3.3 - MCRowの構造と動作
+  【MCRow構造】6フィールド:
+    CN1, CN2, CN3: 次にアクセスされる可能性が高いチャンク番号（頻度順）
+    P1, P2, P3: 対応するチャンクへのアクセス頻度（カウンタ）
+  
+  【更新アルゴリズム】チャンクCから次のチャンクNへアクセス時:
+    1. N==CN1/CN2/CN3 なら対応するPxを+1
+    2. Nが新規なら CN3=N, P3=1 で初期化
+    3. 頻度順ソート（P1≥P2≥P3維持、同値なら最新を優先）
+  
+  【予測とプリフェッチ】
+    - 常にCN1（最頻出チャンク）を次のアクセス先として予測
+    - ユーザー定義のプリフェッチウィンドウサイズで先読み
+    - Linux RAと異なり固定ウィンドウ（動的調整なし）
 
-3. 予測とプリフェッチ (Section 3.3)
-   - 常にCN1を予測値として使用
-   - ユーザー定義のプリフェッチウィンドウサイズで実行
-   - 固定ウィンドウサイズ（動的調整なし）
+■ Section 3.3 - 8ステップ動作シーケンス
+  1. ディスクI/O読み取り要求
+  2. メモリ内のデータ存在確認（キャッシュヒット/ミス判定）
+  3. ミス時、ディスクから読み取り
+  4. データをメモリに読み込み
+  5. 既存MCRowの確認
+  6. MCRow情報の更新（前回チャンク→現在チャンク遷移を記録）
+  7. 更新されたMCRowの予測に基づきプリフェッチ実行
+  8. MCRow不在時、新規作成
 
-4. 動的管理 (Section 3.2)
-   - アクセスされたチャンクのみMCRowを動的作成
-   - クラスタ化による効率的なメモリ管理
+■ Section 4 - 性能評価
+  - キャッシュヒット率: Linux ReadAheadとの比較
+  - プリフェッチ精度: プリフェッチされたデータの実使用率
+  - メモリオーバーヘッド: MCRow数 × 24B
 
-5. 性能評価 (Section 4)
-   - キャッシュヒット率で評価
-   - ミスプリフェッチ率の測定
-   - メモリオーバーヘッドの記録
-
-【実装の制限】
-- 論文に記載のない処理は実装していません
-- 推測や仮定に基づく機能は含まれていません
+【重要な修正点】
+本版では以下の論文準拠性を修正：
+  ✓ プリフェッチ精度測定: 直前の予測が次のアクセスで的中したかを評価
+  ✓ MCRow更新: チャンクC→Nの遷移を正しく記録
+  ✓ 8ステップシーケンスの完全実装
 ================================================================================
 """
 
@@ -49,21 +63,39 @@ matplotlib.use('Agg')  # GUIなし環境対応
 # ================================================================================
 
 class SimulatorConfig:
-    """シミュレータの全設定を管理するクラス"""
+    """
+    シミュレータの全設定を管理するクラス
     
-    # === 基本パラメータ（論文準拠・必須） ===
+    【論文パラメータとの対応】
+    Section 4で評価に使用されたパラメータ範囲を参考に設定。
+    """
+    
+    # === 基本パラメータ（論文Section 3.2, 4.1） ===
     TOTAL_BLOCKS = 50000           # 総ブロック数（例: 200MB相当、4KB/ブロック）
+                                    # 論文: KVM=10,888, カーネルビルド=2,086,048
+    
     CHUNK_SIZE = 4                 # チャンクサイズ（ブロック数/チャンク）
+                                    # 論文Section 4: 8, 16, 32, 64, 128, 256を評価
+    
     CLUSTER_SIZE = 64              # クラスタサイズ（チャンク数/クラスタ）
+                                    # 論文Section 4: 16, 32, 64, 128を評価
+                                    # メモリ使用量計算に使用
     
-    # === キャッシュ設定（論文Section 4.1: 2GB使用） ===
-    CACHE_SIZE = 524288            # キャッシュサイズ（ブロック数）= 2GB÷4KB
+    # === キャッシュ設定（論文Section 4.1） ===
+    CACHE_SIZE = 524288            # キャッシュサイズ（ブロック数）
+                                    # 論文記載: "2GB buffer cache"
+                                    # 計算: 2GB ÷ 4KB = 524,288ブロック
     
-    # === プリフェッチ設定（論文Section 3.3: ユーザー定義可能） ===
-    PREFETCH_WINDOW_SIZE = 8       # プリフェッチウィンドウ（ブロック数）= 32KB÷4KB
+    # === プリフェッチ設定（論文Section 3.3） ===
+    PREFETCH_WINDOW_SIZE = 8       # プリフェッチウィンドウ（ブロック数）
+                                    # 論文: "prefetch window size that can be 
+                                    # defined by the user" - 単位は明記されていないが
+                                    # ブロック単位が妥当（Linux RAは128KB=32ブロック）
+                                    # 論文Section 4: 8, 16, 32を評価
     
     # === ワークロード設定 ===
     WORKLOAD_TYPE = "mixed"        # "sequential", "random", "mixed"
+                                    # 論文は実トレース使用、本実装は合成ワークロード
     WORKLOAD_SIZE = 10000          # I/Oアクセス回数
     
     # === 高度なワークロード設定（mixedモード用） ===
@@ -84,25 +116,51 @@ class SimulatorConfig:
 
 class MCRow:
     """
-    論文Section 3.3のMCRow構造
-    6フィールド: CN1, CN2, CN3（チャンク番号）、P1, P2, P3（頻度）
+    【論文Section 3.3のMCRow構造 - 完全準拠実装】
+    
+    6フィールド構造:
+      CN1, CN2, CN3: 次にアクセスされる可能性が高いチャンク番号
+      P1, P2, P3: 対応するチャンクへのアクセス頻度（カウンタ）
+    
+    論文記載:
+    "Each row of the Markov chain represents the probability of accessing 
+    the next chunk, where CN1, CN2, CN3 indicate the chunk numbers most 
+    likely to be accessed next, and P1, P2, P3 indicate the frequency of 
+    accessing the corresponding chunks."
+    
+    不変条件: P1 ≥ P2 ≥ P3 （常に頻度順でソート維持）
     """
     def __init__(self):
         self.CN1 = 0  # 最頻出チャンク番号
-        self.P1 = 0   # CN1の頻度
+        self.P1 = 0   # CN1の頻度（アクセス回数）
         self.CN2 = 0  # 2番目に頻出チャンク番号
         self.P2 = 0   # CN2の頻度
-        self.CN3 = 0  # 最近アクセスチャンク番号（ソートバッファ）
+        self.CN3 = 0  # 3番目 or 最近アクセスチャンク（ソートバッファ）
         self.P3 = 0   # CN3の頻度
     
     def update(self, next_chunk):
         """
-        論文Section 3.3のアルゴリズム:
-        1. 既存CNxと一致する場合、Pxを+1
-        2. 新規チャンクの場合、CN3に追加、P3=1
-        3. 頻度順でソート（同値なら最近更新を優先）
+        【論文Section 3.3の更新アルゴリズム - 完全準拠】
+        
+        チャンクCから次のチャンクNへアクセス時の動作:
+        
+        1. 既存CNxとの照合:
+           - N==CN1 → P1を+1
+           - N==CN2 → P2を+1
+           - N==CN3 → P3を+1
+           - 該当なし → CN3=N, P3=1 で新規登録
+        
+        2. 頻度順ソート:
+           - P1 ≥ P2 ≥ P3 を維持
+           - 同値の場合、最新更新を優先（論文記載）
+        
+        論文記載:
+        "With each I/O access, the Px values are updated, and CNx values 
+        are rearranged... If there is a new I/O request for a chunk that 
+        does not yet exist in CNx, the existing CN3 and P3 are initialized 
+        with the recently accessed chunk number and 1, respectively."
         """
-        # 既存チャンクの頻度更新
+        # Step 1: 既存チャンクの頻度更新 or 新規チャンク登録
         if next_chunk == self.CN1:
             self.P1 += 1
         elif next_chunk == self.CN2:
@@ -110,24 +168,49 @@ class MCRow:
         elif next_chunk == self.CN3:
             self.P3 += 1
         else:
-            # 新規チャンク: CN3に追加
+            # 新規チャンク: CN3に追加（論文記載通り）
             self.CN3 = next_chunk
             self.P3 = 1
         
-        # 頻度順でソート（P1 >= P2 >= P3を維持）
+        # Step 2: 頻度順ソート（P1 ≥ P2 ≥ P3を維持）
         self._sort()
     
     def _sort(self):
-        """頻度順にCNxをソート（論文: 同値なら最近更新を優先）"""
-        entries = [(self.CN1, self.P1, 1), (self.CN2, self.P2, 2), (self.CN3, self.P3, 3)]
-        entries.sort(key=lambda x: (-x[1], -x[2]))  # 頻度降順、同値なら番号降順
+        """
+        頻度順にCNxをソート
+        
+        ソート規則（論文Section 3.3）:
+          - 第1キー: 頻度降順（P値が大きい順）
+          - 第2キー: 最新更新優先（同値なら番号が大きい方=最近更新）
+        
+        論文記載:
+        "When multiple Px values are equal, the most recently updated value 
+        is considered to have a higher probability of being accessed next."
+        """
+        entries = [
+            (self.CN1, self.P1, 1),  # (チャンク番号, 頻度, 優先度番号)
+            (self.CN2, self.P2, 2),
+            (self.CN3, self.P3, 3)
+        ]
+        # 頻度降順、同値なら番号降順（3→2→1の順で最新）
+        entries.sort(key=lambda x: (-x[1], -x[2]))
         
         self.CN1, self.P1 = entries[0][0], entries[0][1]
         self.CN2, self.P2 = entries[1][0], entries[1][1]
         self.CN3, self.P3 = entries[2][0], entries[2][1]
     
     def predict(self):
-        """論文Section 3.3: 常にCN1を予測値として返す"""
+        """
+        【論文Section 3.3の予測メカニズム - 完全準拠】
+        
+        常にCN1（最頻出チャンク）を次のアクセス先として予測。
+        
+        論文記載:
+        "For prefetching purposes, the CluMP always refers to CN1 and 
+        uses it to predict the next I/O request."
+        
+        戻り値: CN1のチャンク番号 (P1>0の場合)、未初期化時はNone
+        """
         return self.CN1 if self.P1 > 0 else None
 
 
@@ -136,12 +219,19 @@ class MCRow:
 # ================================================================================
 
 class CluMPSimulator:
-    """論文アルゴリズムの完全実装"""
+    """
+    論文Section 3.3の8ステップアルゴリズム完全実装
+    
+    【重要な設計判断】
+    - プリフェッチ精度: 直前の予測(t-1で予測したチャンク)が現在のアクセス(t)と
+      一致するかで評価（論文の意図に準拠）
+    - MCRow更新: チャンクC(前回)→チャンクN(今回)の遷移を記録
+    """
     
     def __init__(self, config):
         self.config = config
         
-        # MCRow管理（動的作成）
+        # MCRow管理（動的作成: Section 3.2）
         self.mc_rows = {}  # {chunk_id: MCRow}
         
         # キャッシュ（LRU方式）
@@ -153,20 +243,26 @@ class CluMPSimulator:
             'total_accesses': 0,
             'cache_hits': 0,
             'cache_misses': 0,
-            'prefetch_hits': 0,
-            'prefetch_misses': 0,
+            'prefetch_hits': 0,        # プリフェッチが使用された回数
+            'prefetch_misses': 0,      # プリフェッチが無駄だった回数
+            'prefetch_issued': 0,      # プリフェッチ実行回数
             'mcrow_count': 0,
             'hit_rate_history': []
         }
         
-        self.last_chunk = None  # 直前のチャンク
+        # 前回の状態（論文の遷移記録に必要）
+        self.last_chunk = None           # 直前にアクセスしたチャンク
+        self.last_predicted_chunk = None # 直前に予測したチャンク
     
     def _block_to_chunk(self, block_id):
-        """ブロック番号からチャンク番号へ変換"""
+        """ブロック番号からチャンク番号へ変換（Section 3.2）"""
         return block_id // self.config.CHUNK_SIZE
     
     def _access_cache(self, block_id):
-        """キャッシュアクセス（LRU更新）"""
+        """
+        キャッシュアクセス（LRU更新）
+        戻り値: True=ヒット, False=ミス
+        """
         if block_id in self.cache:
             # ヒット: LRU更新
             self.cache_lru.remove(block_id)
@@ -184,7 +280,7 @@ class CluMPSimulator:
             return False
     
     def _get_or_create_mcrow(self, chunk_id):
-        """MCRowを取得または動的作成（論文Section 3.2）"""
+        """MCRowを取得または動的作成（Section 3.2の動的管理）"""
         if chunk_id not in self.mc_rows:
             self.mc_rows[chunk_id] = MCRow()
             self.stats['mcrow_count'] = len(self.mc_rows)
@@ -192,8 +288,14 @@ class CluMPSimulator:
     
     def _prefetch(self, predicted_chunk):
         """
-        プリフェッチ実行（論文Section 3.3）
-        予測チャンクからプリフェッチウィンドウサイズ分読み込み
+        プリフェッチ実行（Section 3.3）
+        予測チャンクから PREFETCH_WINDOW_SIZE ブロック分をメモリに先読み
+        
+        【論文準拠の根拠】
+        "Once the predicted chunk is determined in CluMP, prefetching is 
+        performed with a prefetch window size that can be defined by the user."
+        
+        戻り値: プリフェッチされたブロックIDのリスト
         """
         if predicted_chunk is None:
             return []
@@ -218,34 +320,66 @@ class CluMPSimulator:
     
     def process_access(self, block_id):
         """
-        1回のI/Oアクセス処理（論文Section 3.3の8ステップアルゴリズム）
+        【論文Section 3.3の8ステップアルゴリズム完全実装】
+        
+        1. ディスクI/O読み取り要求
+        2. メモリ内のデータ存在確認
+        3. ミス時、ディスクから読み取り
+        4. データをメモリに読み込み
+        5. 既存MCRowの確認
+        6. MCRow情報の更新（前回チャンク→現在チャンクの遷移を記録）
+        7. 更新されたMCRowの予測に基づきプリフェッチ実行
+        8. MCRow不在時、新規作成
+        
+        【重要な修正点】
+        プリフェッチ精度の測定:
+          - 直前(t-1)に予測したチャンクと今回(t)のアクセスチャンクを比較
+          - これにより「予測が次のアクセスで的中したか」を正しく評価
         """
         self.stats['total_accesses'] += 1
         current_chunk = self._block_to_chunk(block_id)
         
-        # Step 1-2: キャッシュ確認
+        # Step 1-2: キャッシュ確認（メモリ内のデータ存在チェック）
         is_hit = self._access_cache(block_id)
         
         if is_hit:
             self.stats['cache_hits'] += 1
         else:
+            # Step 3-4: ミス時、ディスクから読み取りメモリに読み込み
             self.stats['cache_misses'] += 1
         
-        # Step 5-6: MCRow確認・更新
-        if self.last_chunk is not None:
-            mcrow = self._get_or_create_mcrow(self.last_chunk)
-            mcrow.update(current_chunk)
-            
-            # Step 7: 予測とプリフェッチ
-            predicted = mcrow.predict()
-            prefetched_blocks = self._prefetch(predicted)
-            
-            # プリフェッチ効果測定（次回アクセスで確認）
-            if predicted == current_chunk:
+        # 【論文準拠の修正】プリフェッチ精度評価
+        # 直前(t-1)の予測が今回(t)のアクセスと一致したかを評価
+        if self.last_predicted_chunk is not None:
+            if self.last_predicted_chunk == current_chunk:
                 self.stats['prefetch_hits'] += 1
             else:
                 self.stats['prefetch_misses'] += 1
         
+        # Step 5-6: MCRowの確認と更新
+        # 前回チャンク → 現在チャンクの遷移を記録
+        if self.last_chunk is not None:
+            # Step 5-8: MCRowを取得または作成
+            mcrow = self._get_or_create_mcrow(self.last_chunk)
+            
+            # Step 6: MCRow情報の更新（前回→今回の遷移を記録）
+            mcrow.update(current_chunk)
+            
+            # Step 7: 更新されたMCRowで予測を実行
+            predicted_chunk = mcrow.predict()
+            
+            # プリフェッチ実行
+            if predicted_chunk is not None:
+                self._prefetch(predicted_chunk)
+                self.stats['prefetch_issued'] += 1
+            
+            # 今回の予測を記録（次回のプリフェッチ精度評価に使用）
+            self.last_predicted_chunk = predicted_chunk
+        else:
+            # 初回アクセス時は予測なし
+            self.last_predicted_chunk = None
+        
+        # 今回のチャンクを記録（次回の遷移記録に使用）
         self.last_chunk = current_chunk
         
         # ヒット率履歴記録（100アクセスごと）
@@ -259,11 +393,17 @@ class CluMPSimulator:
         if total == 0:
             return {}
         
+        # プリフェッチ精度: プリフェッチが実際に使用された割合
+        prefetch_total = self.stats['prefetch_hits'] + self.stats['prefetch_misses']
+        
         return {
             'cache_hit_rate': self.stats['cache_hits'] / total,
             'cache_miss_rate': self.stats['cache_misses'] / total,
-            'prefetch_accuracy': (self.stats['prefetch_hits'] / 
-                                  max(1, self.stats['prefetch_hits'] + self.stats['prefetch_misses'])),
+            'prefetch_accuracy': (self.stats['prefetch_hits'] / prefetch_total 
+                                  if prefetch_total > 0 else 0),
+            'prefetch_hits': self.stats['prefetch_hits'],
+            'prefetch_misses': self.stats['prefetch_misses'],
+            'prefetch_issued': self.stats['prefetch_issued'],
             'mcrow_count': self.stats['mcrow_count'],
             'memory_usage_kb': self.stats['mcrow_count'] * 24 / 1024,  # 24B/MCRow
             'hit_rate_history': self.stats['hit_rate_history']
@@ -275,7 +415,22 @@ class CluMPSimulator:
 # ================================================================================
 
 class WorkloadGenerator:
-    """各種ワークロードパターンの生成"""
+    """
+    各種ワークロードパターンの生成
+    
+    【論文Section 4.1との関係】
+    論文では実際のI/Oトレース（iosnoopによるログ）を使用。
+    本シミュレータは合成ワークロードで近似的に再現。
+    
+    実ワークロード:
+      - KVM起動: 42.53MB (10,888ブロック)
+      - Linuxカーネルビルド: 7.96GB (2,086,048ブロック)
+    
+    合成ワークロードの特徴:
+      - Sequential: 完全逐次アクセス
+      - Random: 完全ランダムアクセス
+      - Mixed: 局所性+逐次性+フェーズ変化+ホットスポット
+    """
     
     def __init__(self, config):
         self.config = config
@@ -352,7 +507,23 @@ class WorkloadGenerator:
 # ================================================================================
 
 class BaselineSimulator:
-    """Linux先読みアルゴリズム相当の単純実装"""
+    """
+    Linux先読みアルゴリズム相当の単純実装
+    
+    【論文Section 2.1, 4との対応】
+    論文で比較対象として使用されているLinux先読みアルゴリズムを模擬。
+    
+    実装の特徴:
+      - 逐次アクセス検出（前回ブロック+1 == 現在ブロック）
+      - 逐次時のみプリフェッチ実行（128KB = 32ブロック相当）
+      - 非逐次時はプリフェッチなし
+    
+    論文記載（Section 2.1）:
+    "Linux readahead algorithm considers the sequentiality of data, 
+    and when I/O operations access consecutive blocks in a sequential 
+    pattern, it pre-loads a set of blocks including the requested block 
+    from the disk into memory."
+    """
     
     def __init__(self, config):
         self.config = config
@@ -473,6 +644,9 @@ def save_results(config, clump_results, baseline_results, workload_info, output_
         f.write("[CluMP 結果]\n")
         f.write(f"キャッシュヒット率: {clump_results['cache_hit_rate']:.2%}\n")
         f.write(f"プリフェッチ精度: {clump_results['prefetch_accuracy']:.2%}\n")
+        f.write(f"プリフェッチ実行回数: {clump_results['prefetch_issued']:,}\n")
+        f.write(f"プリフェッチヒット: {clump_results['prefetch_hits']:,}\n")
+        f.write(f"プリフェッチミス: {clump_results['prefetch_misses']:,}\n")
         f.write(f"MCRow数: {clump_results['mcrow_count']:,}\n")
         f.write(f"メモリ使用量: {clump_results['memory_usage_kb']:.2f} KB\n\n")
         
@@ -590,6 +764,9 @@ def main():
     print(f"Baseline ヒット率: {baseline_results['cache_hit_rate']:.2%}")
     print(f"改善率: {improvement:.2f}x ({improvement * 100 - 100:+.1f}%)")
     print(f"\nCluMP プリフェッチ精度: {clump_results['prefetch_accuracy']:.2%}")
+    print(f"プリフェッチ実行回数: {clump_results['prefetch_issued']:,}")
+    print(f"プリフェッチヒット: {clump_results['prefetch_hits']:,}")
+    print(f"プリフェッチミス: {clump_results['prefetch_misses']:,}")
     print(f"MCRow 数: {clump_results['mcrow_count']:,}")
     print(f"メモリ使用量: {clump_results['memory_usage_kb']:.2f} KB")
     
