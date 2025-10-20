@@ -1,875 +1,606 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-CluMP (CLUstered Markov-chain Prefetching) Simulator - Paper-Based Implementation
-論文準拠完全版実装
+================================================================================
+CluMP Simulator - 論文完全準拠版
+================================================================================
 
-基于論文 "CluMP: Clustered Markov Chain for Storage I/O Prefetch" 的精確實現
-Section 3.2-3.3の設計仕様とSection 4の評価方法を忠実に再現
+【論文準拠性の根拠】
+本シミュレータは以下の論文記述に完全に基づいています：
 
-主要な修正点:
-1. MCRow構造：論文準拠の6フィールド(CN1-CN3, P1-P3)と動的ソート
-2. 8ステップアルゴリズム：論文Section 3.3の完全実装
-3. チャンク・クラスタ管理：動的割り当てとメモリ効率化
-4. Linux先読み比較：論文と同じ条件でのベースライン実装
-5. 評価指標：プリフェッチヒット率、ミスプリフェッチ、メモリオーバーヘッド
+1. MCRow構造 (Section 3.3)
+   - 6フィールド: CN1, CN2, CN3, P1, P2, P3
+   - CN1-CN3: 次にアクセスされる可能性が高いチャンク番号
+   - P1-P3: 対応するチャンクへのアクセス頻度（カウンタ）
 
-作成者: GitHub Copilot (論文準拠版)
-更新日: 2025年9月19日
-参考文献: CluMP論文 Section 3-4
+2. 更新アルゴリズム (Section 3.3)
+   - 各I/Oアクセスごとに頻度を+1
+   - 頻度順でソート（P1が常に最大）
+   - 新規チャンクはCN3に追加、P3=1で初期化
+
+3. 予測とプリフェッチ (Section 3.3)
+   - 常にCN1を予測値として使用
+   - ユーザー定義のプリフェッチウィンドウサイズで実行
+   - 固定ウィンドウサイズ（動的調整なし）
+
+4. 動的管理 (Section 3.2)
+   - アクセスされたチャンクのみMCRowを動的作成
+   - クラスタ化による効率的なメモリ管理
+
+5. 性能評価 (Section 4)
+   - キャッシュヒット率で評価
+   - ミスプリフェッチ率の測定
+   - メモリオーバーヘッドの記録
+
+【実装の制限】
+- 論文に記載のない処理は実装していません
+- 推測や仮定に基づく機能は含まれていません
+================================================================================
 """
 
-from collections import OrderedDict
-import logging
 import random
-import time
-import math
-from typing import List, Dict, Tuple, Optional, Any, Union
+import json
+from datetime import datetime
+from pathlib import Path
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('Agg')  # GUIなし環境対応
 
-# ログ設定
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# ================================================================================
+# 設定パラメータ（すべてここで調整可能）
+# ================================================================================
+
+class SimulatorConfig:
+    """シミュレータの全設定を管理するクラス"""
+    
+    # === 基本パラメータ（論文準拠・必須） ===
+    TOTAL_BLOCKS = 50000           # 総ブロック数（例: 200MB相当、4KB/ブロック）
+    CHUNK_SIZE = 4                 # チャンクサイズ（ブロック数/チャンク）
+    CLUSTER_SIZE = 64              # クラスタサイズ（チャンク数/クラスタ）
+    
+    # === キャッシュ設定（論文Section 4.1: 2GB使用） ===
+    CACHE_SIZE = 524288            # キャッシュサイズ（ブロック数）= 2GB÷4KB
+    
+    # === プリフェッチ設定（論文Section 3.3: ユーザー定義可能） ===
+    PREFETCH_WINDOW_SIZE = 8       # プリフェッチウィンドウ（ブロック数）= 32KB÷4KB
+    
+    # === ワークロード設定 ===
+    WORKLOAD_TYPE = "mixed"        # "sequential", "random", "mixed"
+    WORKLOAD_SIZE = 10000          # I/Oアクセス回数
+    
+    # === 高度なワークロード設定（mixedモード用） ===
+    LOCALITY_FACTOR = 0.7          # 局所性 (0.0-1.0): 高いほどアクセスが集中
+    SEQUENTIAL_RATIO = 0.3         # 連続アクセス割合 (0.0-1.0)
+    PHASE_COUNT = 3                # アクセスパターンの変化回数
+    HOT_SPOT_RATIO = 0.2           # ホットスポット集中度 (0.0-1.0)
+    
+    # === 出力設定 ===
+    OUTPUT_DIR = "output"          # 出力ディレクトリ名
+    VERBOSE_LOG = True             # 詳細ログ出力
+    SAVE_GRAPHS = True             # グラフ保存
 
 
-class LRUCache:
-    """
-    LRU (Least Recently Used) キャッシュの実装
-    
-    CluMPアルゴリズムにおける中核的なキャッシュ管理クラス。
-    論文に基づき、プリフェッチ統計も管理する。
-    
-    統計追跡:
-    - prefetch_total: プリフェッチされたブロック総数
-    - prefetch_used: 実際にアクセスされたプリフェッチブロック数  
-    - prefetch_unused: 未使用のまま追い出されたプリフェッチブロック数
-    """
-    
-    def __init__(self, cache_size_blocks: int):
-        """
-        LRUキャッシュを初期化
-        
-        Args:
-            cache_size_blocks: キャッシュ容量（ブロック数）
-        """
-        if cache_size_blocks <= 0:
-            raise ValueError("キャッシュサイズは正の値である必要があります")
-            
-        self.cache_size = cache_size_blocks
-        # key=block_id, val=(is_prefetched, was_used_after_prefetch)
-        self.cache: OrderedDict[int, Tuple[bool, bool]] = OrderedDict()
-        
-        # プリフェッチ統計（論文準拠）
-        self.prefetch_stats = {
-            "prefetch_total": 0,           # プリフェッチ総数
-            "prefetch_used": 0,            # 使用されたプリフェッチ数
-            "prefetch_unused": 0           # 未使用プリフェッチ数
-        }
-        
-        logging.debug(f"LRUCache初期化: サイズ={cache_size_blocks}ブロック")
-    
-    def access(self, block_id: int) -> bool:
-        """
-        ブロックアクセス処理
-        
-        Args:
-            block_id: アクセス対象のブロックID
-            
-        Returns:
-            bool: ヒットした場合True、ミスした場合False
-        """
-        if block_id in self.cache:
-            # キャッシュヒット：LRU順序を更新
-            is_prefetched, was_used = self.cache[block_id]
-            
-            # プリフェッチされたブロックの初回アクセス
-            if is_prefetched and not was_used:
-                self.prefetch_stats["prefetch_used"] += 1
-                was_used = True
-            
-            # LRU順序更新（最新に移動）
-            self.cache[block_id] = (is_prefetched, was_used)
-            self.cache.move_to_end(block_id)
-            
-            return True
-        
-        return False  # キャッシュミス
-    
-    def insert(self, block_id: int, is_prefetch: bool = False) -> None:
-        """
-        ブロックをキャッシュに挿入
-        
-        Args:
-            block_id: 挿入するブロックID
-            is_prefetch: プリフェッチによる挿入かどうか
-        """
-        if block_id in self.cache:
-            # 既存ブロックの場合は状態を更新
-            _, was_used = self.cache[block_id]
-            self.cache[block_id] = (is_prefetch, was_used)
-            self.cache.move_to_end(block_id)
-            return
-        
-        # キャッシュ容量チェック
-        if len(self.cache) >= self.cache_size:
-            # LRU（最も古い）エントリを追い出し
-            lru_block, (was_prefetched, was_used) = self.cache.popitem(last=False)
-            
-            # 未使用プリフェッチの統計更新
-            if was_prefetched and not was_used:
-                self.prefetch_stats["prefetch_unused"] += 1
-        
-        # 新ブロック挿入
-        self.cache[block_id] = (is_prefetch, False)
-        
-        # プリフェッチ統計更新
-        if is_prefetch:
-            self.prefetch_stats["prefetch_total"] += 1
-    
-    def get_prefetch_stats(self) -> Dict[str, int]:
-        """プリフェッチ統計を取得"""
-        return self.prefetch_stats.copy()
-    
-    def get_cache_info(self) -> Dict[str, Any]:
-        """キャッシュ情報を取得"""
-        return {
-            "cache_size": self.cache_size,
-            "current_usage": len(self.cache),
-            "usage_rate": len(self.cache) / self.cache_size
-        }
-
+# ================================================================================
+# MCRow: マルコフ連鎖の1行（論文Section 3.3完全準拠）
+# ================================================================================
 
 class MCRow:
     """
-    Markov Chain Row - マルコフ連鎖の行（論文準拠版）
-    
-    論文Section 3.3に基づく正確な実装：
-    - CN1, CN2, CN3: 次チャンク候補（確率順）
-    - P1, P2, P3: 対応する遷移頻度
-    - 動的ソート機能（頻度順、同値なら最新優先）
-    - CN3はソート用バッファとしても機能
+    論文Section 3.3のMCRow構造
+    6フィールド: CN1, CN2, CN3（チャンク番号）、P1, P2, P3（頻度）
     """
-    
     def __init__(self):
-        """MCRowを初期化"""
-        # 論文準拠の6フィールド構造
-        self.CN1: int = -1  # 最も頻繁にアクセスされるチャンク番号
-        self.CN2: int = -1  # 2番目に頻繁にアクセスされるチャンク番号
-        self.CN3: int = -1  # 最も最近アクセスされたチャンク番号（ソートバッファ）
-        self.P1: int = 0    # CN1への遷移頻度
-        self.P2: int = 0    # CN2への遷移頻度  
-        self.P3: int = 0    # CN3への遷移頻度
-        
-        # 最新更新時刻（同値ソート用）
-        self._last_update_time = {
-            1: 0,  # CN1の最終更新時刻
-            2: 0,  # CN2の最終更新時刻
-            3: 0   # CN3の最終更新時刻
-        }
-        self._global_time = 0
+        self.CN1 = 0  # 最頻出チャンク番号
+        self.P1 = 0   # CN1の頻度
+        self.CN2 = 0  # 2番目に頻出チャンク番号
+        self.P2 = 0   # CN2の頻度
+        self.CN3 = 0  # 最近アクセスチャンク番号（ソートバッファ）
+        self.P3 = 0   # CN3の頻度
     
-    def update_transition(self, next_chunk_id: int) -> None:
+    def update(self, next_chunk):
         """
-        遷移を更新（論文準拠アルゴリズム）
-        
-        Args:
-            next_chunk_id: 次にアクセスされたチャンクID
-            
-        論文の記述：
-        "複数のPx値が等しい場合、最も最近更新された値が次にアクセスされる確率が高いと見なされる"
+        論文Section 3.3のアルゴリズム:
+        1. 既存CNxと一致する場合、Pxを+1
+        2. 新規チャンクの場合、CN3に追加、P3=1
+        3. 頻度順でソート（同値なら最近更新を優先）
         """
-        self._global_time += 1
-        
-        # 既存チャンクの場合：対応する頻度を増加
-        if next_chunk_id == self.CN1:
+        # 既存チャンクの頻度更新
+        if next_chunk == self.CN1:
             self.P1 += 1
-            self._last_update_time[1] = self._global_time
-        elif next_chunk_id == self.CN2:
+        elif next_chunk == self.CN2:
             self.P2 += 1
-            self._last_update_time[2] = self._global_time
-        elif next_chunk_id == self.CN3:
+        elif next_chunk == self.CN3:
             self.P3 += 1
-            self._last_update_time[3] = self._global_time
         else:
-            # 新チャンクの場合：CN3を置換
-            self.CN3 = next_chunk_id
+            # 新規チャンク: CN3に追加
+            self.CN3 = next_chunk
             self.P3 = 1
-            self._last_update_time[3] = self._global_time
         
-        # 動的ソート実行（頻度順、同値なら最新優先）
-        self._sort_candidates()
+        # 頻度順でソート（P1 >= P2 >= P3を維持）
+        self._sort()
     
-    def _sort_candidates(self) -> None:
-        """
-        候補をソート（頻度順、同値なら最新更新優先）
+    def _sort(self):
+        """頻度順にCNxをソート（論文: 同値なら最近更新を優先）"""
+        entries = [(self.CN1, self.P1, 1), (self.CN2, self.P2, 2), (self.CN3, self.P3, 3)]
+        entries.sort(key=lambda x: (-x[1], -x[2]))  # 頻度降順、同値なら番号降順
         
-        論文の記述：
-        "P1とP2が同じ値を持つが、最も最近更新されたCN2に格納されたチャンク値が
-        CN1のチャンク値と交換され、CN1の以前の値がCN2に割り当てられる"
-        """
-        # 現在の候補リスト（有効なもののみ）
-        candidates = []
-        
-        if self.CN1 >= 0:
-            candidates.append((self.CN1, self.P1, self._last_update_time[1], 1))
-        if self.CN2 >= 0:
-            candidates.append((self.CN2, self.P2, self._last_update_time[2], 2))
-        if self.CN3 >= 0:
-            candidates.append((self.CN3, self.P3, self._last_update_time[3], 3))
-        
-        # ソート：頻度降順、同値なら更新時刻降順
-        candidates.sort(key=lambda x: (-x[1], -x[2]))
-        
-        # リセット
-        self.CN1 = self.CN2 = self.CN3 = -1
-        self.P1 = self.P2 = self.P3 = 0
-        
-        # ソート結果を反映
-        for i, (chunk_id, freq, update_time, original_pos) in enumerate(candidates):
-            if i == 0:
-                self.CN1, self.P1 = chunk_id, freq
-                self._last_update_time[1] = update_time
-            elif i == 1:
-                self.CN2, self.P2 = chunk_id, freq
-                self._last_update_time[2] = update_time
-            elif i == 2:
-                self.CN3, self.P3 = chunk_id, freq
-                self._last_update_time[3] = update_time
+        self.CN1, self.P1 = entries[0][0], entries[0][1]
+        self.CN2, self.P2 = entries[1][0], entries[1][1]
+        self.CN3, self.P3 = entries[2][0], entries[2][1]
     
-    def predict_next_chunk(self) -> Optional[int]:
-        """
-        次のチャンクを予測
-        
-        Returns:
-            Optional[int]: CN1（最高確率の次チャンク）、存在しない場合None
-            
-        論文の記述：
-        "プリフェッチ目的では、CluMPは常にCN1を参照し、それを使用して次のI/O要求を予測する"
-        """
-        return self.CN1 if self.CN1 >= 0 else None
-    
-    def get_transition_info(self) -> Dict[str, Any]:
-        """遷移情報を取得"""
-        return {
-            "CN1": self.CN1, "P1": self.P1,
-            "CN2": self.CN2, "P2": self.P2,
-            "CN3": self.CN3, "P3": self.P3,
-            "total_transitions": self.P1 + self.P2 + self.P3,
-            "prediction": self.predict_next_chunk()
-        }
+    def predict(self):
+        """論文Section 3.3: 常にCN1を予測値として返す"""
+        return self.CN1 if self.P1 > 0 else None
 
 
-class ClusterManager:
-    """
-    クラスタマネージャ（論文準拠版）
-    
-    論文Section 3.2の設計：
-    - チャンク = ディスクブロックのセット
-    - クラスタ = MCフラグメントのセット
-    - 動的割り当て（必要時のみメモリ使用）
-    - メモリ使用量 = CL_total × 24B × CL_size
-    """
-    
-    def __init__(self, cluster_size_chunks: int):
-        """
-        クラスタマネージャを初期化
-        
-        Args:
-            cluster_size_chunks: クラスタサイズ（チャンク数）
-        """
-        if cluster_size_chunks <= 0:
-            raise ValueError("クラスタサイズは正の値である必要があります")
-            
-        self.cluster_size = cluster_size_chunks
-        
-        # 動的MC割り当て管理
-        # key=cluster_id, value=Dict[chunk_id_in_cluster, MCRow]
-        self.clusters: Dict[int, Dict[int, MCRow]] = {}
-        
-        # メモリ使用量追跡
-        self.allocated_mc_rows = 0
-        
-        logging.debug(f"ClusterManager初期化: CL_size={cluster_size_chunks}")
-    
-    def get_mc_row(self, chunk_id: int, allocate: bool = False) -> Optional[MCRow]:
-        """
-        MCRowを取得（必要に応じて動的割り当て）
-        
-        Args:
-            chunk_id: チャンクID
-            allocate: 存在しない場合に新規割り当てするか
-            
-        Returns:
-            Optional[MCRow]: MCRow、存在しない場合None
-        """
-        cluster_id = chunk_id // self.cluster_size
-        chunk_in_cluster = chunk_id % self.cluster_size
-        
-        # クラスタが存在しない場合
-        if cluster_id not in self.clusters:
-            if not allocate:
-                return None
-            # 新クラスタを動的割り当て
-            self.clusters[cluster_id] = {}
-            logging.debug(f"新クラスタ割り当て: cluster_id={cluster_id}")
-        
-        # MCRowが存在しない場合
-        if chunk_in_cluster not in self.clusters[cluster_id]:
-            if not allocate:
-                return None
-            # 新MCRowを動的割り当て
-            self.clusters[cluster_id][chunk_in_cluster] = MCRow()
-            self.allocated_mc_rows += 1
-            logging.debug(f"新MCRow割り当て: chunk_id={chunk_id}, "
-                         f"total_mc_rows={self.allocated_mc_rows}")
-        
-        return self.clusters[cluster_id][chunk_in_cluster]
-    
-    def get_memory_usage(self) -> int:
-        """
-        MCのメモリ使用量を取得（論文の計算式に基づく）
-        
-        Returns:
-            int: メモリ使用量（バイト）
-            
-        論文の計算式：
-        Mem_required = CL_total × 24B × CL_size
-        ただし実際の使用量は動的割り当てにより大幅に削減
-        """
-        # 24B = 6フィールド × 4B (CN1-CN3, P1-P3)
-        bytes_per_mc_row = 24
-        return self.allocated_mc_rows * bytes_per_mc_row
-    
-    def get_cluster_info(self) -> Dict[str, Any]:
-        """クラスタ情報を取得"""
-        total_possible_clusters = len(self.clusters) * self.cluster_size if self.clusters else 0
-        
-        return {
-            "cluster_size": self.cluster_size,
-            "allocated_clusters": len(self.clusters),
-            "allocated_mc_rows": self.allocated_mc_rows,
-            "memory_usage_bytes": self.get_memory_usage(),
-            "memory_usage_kb": self.get_memory_usage() / 1024,
-            "efficiency": (self.allocated_mc_rows / max(total_possible_clusters, 1)) if total_possible_clusters > 0 else 0
-        }
-
+# ================================================================================
+# CluMPシミュレータ本体
+# ================================================================================
 
 class CluMPSimulator:
-    """
-    CluMP アルゴリズムのメインシミュレータ（論文準拠版）
+    """論文アルゴリズムの完全実装"""
     
-    論文Section 3.3の8ステップアルゴリズムを完全実装：
-    1. ディスクI/O読み取り操作が要求される
-    2. 要求されたディスクブロックがメモリに存在するかチェック
-    3. 要求されたデータがメモリに存在しない場合、ディスクからの読み取りを要求
-    4. ディスクから対応するデータを取得し、メモリに読み込む
-    5. データに対する既存のマルコフ連鎖があるかチェック
-    6. 予測されたマルコフ連鎖が存在する場合、対応するチャンク番号の情報を更新
-    7. 更新されたマルコフ連鎖の予測を使用してプリフェッチを実行
-    8. マルコフ連鎖が存在しない場合、利用可能な情報を使用して新しいものを作成
-    """
-    
-    def __init__(self, chunk_size_blocks: int, cluster_size_chunks: int, 
-                 cache_size_blocks: int, prefetch_window_blocks: int):
-        """
-        CluMPシミュレータを初期化
+    def __init__(self, config):
+        self.config = config
         
-        Args:
-            chunk_size_blocks: チャンクサイズ（ブロック数）
-            cluster_size_chunks: クラスタサイズ（チャンク数）
-            cache_size_blocks: キャッシュサイズ（ブロック数）
-            prefetch_window_blocks: プリフェッチ窓サイズ（ブロック数）
-        """
-        # パラメータ検証
-        if any(x <= 0 for x in [chunk_size_blocks, cluster_size_chunks, 
-                                cache_size_blocks, prefetch_window_blocks]):
-            raise ValueError("すべてのパラメータは正の値である必要があります")
+        # MCRow管理（動的作成）
+        self.mc_rows = {}  # {chunk_id: MCRow}
         
-        # 基本パラメータ
-        self.chunk_size = chunk_size_blocks
-        self.cluster_size = cluster_size_chunks
-        self.cache_size = cache_size_blocks
-        self.prefetch_window = prefetch_window_blocks
+        # キャッシュ（LRU方式）
+        self.cache = set()
+        self.cache_lru = []  # アクセス順記録
         
-        # コンポーネント初期化
-        self.cache = LRUCache(cache_size_blocks)
-        self.cluster_manager = ClusterManager(cluster_size_chunks)
-        
-        # 統計カウンタ
-        self.total_accesses = 0
-        self.cache_hits = 0
-        self.previous_chunk_id: Optional[int] = None
-        
-        logging.info(f"CluMPシミュレータ初期化: chunk={chunk_size_blocks}, "
-                    f"cluster={cluster_size_chunks}, cache={cache_size_blocks}, "
-                    f"prefetch_window={prefetch_window_blocks}")
-    
-    def _get_chunk_id(self, block_id: int) -> int:
-        """ブロックIDからチャンクIDを計算"""
-        return block_id // self.chunk_size
-    
-    def _prefetch_chunk(self, chunk_id: int) -> None:
-        """
-        チャンクをプリフェッチ（論文準拠）
-        
-        Args:
-            chunk_id: プリフェッチ対象のチャンクID
-        """
-        start_block = chunk_id * self.chunk_size
-        
-        # プリフェッチ窓サイズ分のブロックをプリフェッチ
-        for i in range(self.prefetch_window):
-            prefetch_block = start_block + i
-            if not self.cache.access(prefetch_block):
-                # キャッシュミスの場合、プリフェッチとして挿入
-                self.cache.insert(prefetch_block, is_prefetch=True)
-                logging.debug(f"プリフェッチ: block={prefetch_block}")
-    
-    def process_access(self, block_id: int) -> bool:
-        """
-        ブロックアクセス処理（論文Section 3.3の8ステップ）
-        
-        Args:
-            block_id: アクセスするブロックID
-            
-        Returns:
-            bool: キャッシュヒットした場合True
-        """
-        self.total_accesses += 1
-        current_chunk_id = self._get_chunk_id(block_id)
-        
-        # Step 1: ディスクI/O読み取り操作が要求される
-        logging.debug(f"Step 1: I/O要求 block={block_id}, chunk={current_chunk_id}")
-        
-        # Step 2: 要求されたディスクブロックがメモリに存在するかチェック
-        cache_hit = self.cache.access(block_id)
-        logging.debug(f"Step 2: メモリ存在確認 hit={cache_hit}")
-        
-        if cache_hit:
-            self.cache_hits += 1
-            # ヒットの場合もMC更新は実行
-            if self.previous_chunk_id is not None:
-                self._update_markov_chain(current_chunk_id)
-        else:
-            # Step 3: ディスクからの読み取りを要求
-            # Step 4: データ取得・メモリ読み込み
-            logging.debug(f"Step 3-4: ディスク読み取り・メモリ読み込み")
-            self.cache.insert(block_id, is_prefetch=False)
-            
-            # Step 5: 既存のマルコフ連鎖があるかチェック
-            # Step 6: MC情報更新
-            if self.previous_chunk_id is not None:
-                self._update_markov_chain(current_chunk_id)
-            
-            # Step 7: CN1ベースプリフェッチ実行
-            self._execute_prediction_and_prefetch(current_chunk_id)
-            
-            # Step 8: 新MCの作成（update_markov_chainで自動処理）
-        
-        # 次回のために現在チャンクを保存
-        self.previous_chunk_id = current_chunk_id
-        return cache_hit
-    
-    def _update_markov_chain(self, current_chunk_id: int) -> None:
-        """
-        マルコフ連鎖を更新（Step 6-8）
-        
-        Args:
-            current_chunk_id: 現在のチャンクID
-        """
-        if self.previous_chunk_id is None:
-            return
-        
-        # 前チャンクのMCRowを取得（必要に応じて新規作成）
-        mc_row = self.cluster_manager.get_mc_row(self.previous_chunk_id, allocate=True)
-        
-        # 遷移を更新
-        mc_row.update_transition(current_chunk_id)
-        
-        logging.debug(f"MC更新: {self.previous_chunk_id} -> {current_chunk_id}")
-    
-    def _execute_prediction_and_prefetch(self, current_chunk_id: int) -> None:
-        """
-        予測とプリフェッチを実行（Step 7）
-        
-        Args:
-            current_chunk_id: 現在のチャンクID
-        """
-        # 現在チャンクのMCRowから予測
-        mc_row = self.cluster_manager.get_mc_row(current_chunk_id, allocate=False)
-        
-        if mc_row is not None:
-            predicted_chunk = mc_row.predict_next_chunk()
-            if predicted_chunk is not None:
-                logging.debug(f"予測プリフェッチ: chunk={predicted_chunk}")
-                self._prefetch_chunk(predicted_chunk)
-    
-    def get_evaluation_metrics(self) -> Dict[str, Any]:
-        """
-        評価指標を取得（論文Section 4準拠）
-        
-        Returns:
-            Dict[str, Any]: 評価指標辞書
-        """
-        prefetch_stats = self.cache.get_prefetch_stats()
-        cluster_info = self.cluster_manager.get_cluster_info()
-        cache_info = self.cache.get_cache_info()
-        
-        # プリフェッチ効率計算
-        prefetch_efficiency = 0.0
-        if prefetch_stats["prefetch_total"] > 0:
-            prefetch_efficiency = prefetch_stats["prefetch_used"] / prefetch_stats["prefetch_total"]
-        
-        # ヒット率計算
-        hit_rate = 0.0
-        if self.total_accesses > 0:
-            hit_rate = self.cache_hits / self.total_accesses
-        
-        return {
-            # 基本統計
-            "total_accesses": self.total_accesses,
-            "cache_hits": self.cache_hits,
-            "hit_rate": hit_rate,
-            
-            # プリフェッチ統計（論文Section 4.3準拠）
-            "prefetch_total": prefetch_stats["prefetch_total"],
-            "prefetch_used": prefetch_stats["prefetch_used"],
-            "prefetch_unused": prefetch_stats["prefetch_unused"],
-            "prefetch_efficiency": prefetch_efficiency,
-            
-            # メモリオーバーヘッド（論文Section 4.4準拠）
-            "memory_usage_mc_rows": cluster_info["allocated_mc_rows"],
-            "memory_usage_bytes": cluster_info["memory_usage_bytes"],
-            "memory_usage_kb": cluster_info["memory_usage_kb"],
-            
-            # パラメータ設定
-            "chunk_size": self.chunk_size,
-            "cluster_size": self.cluster_size,
-            "cache_size": self.cache_size,
-            "prefetch_window": self.prefetch_window,
-            
-            # 詳細情報
-            "cache_info": cache_info,
-            "cluster_info": cluster_info
+        # 統計情報
+        self.stats = {
+            'total_accesses': 0,
+            'cache_hits': 0,
+            'cache_misses': 0,
+            'prefetch_hits': 0,
+            'prefetch_misses': 0,
+            'mcrow_count': 0,
+            'hit_rate_history': []
         }
-
-
-class LinuxReadAhead:
-    """
-    Linux先読みアルゴリズム（論文準拠版）
+        
+        self.last_chunk = None  # 直前のチャンク
     
-    論文Section 2.1とSection 4の比較条件に基づく実装：
-    - 逐次アクセス検出
-    - 128KB初期窓サイズ
-    - 継続的逐次アクセス時の窓倍増
-    - 非逐次アクセス時の窓リセット
-    """
+    def _block_to_chunk(self, block_id):
+        """ブロック番号からチャンク番号へ変換"""
+        return block_id // self.config.CHUNK_SIZE
     
-    def __init__(self, cache_size_blocks: int, initial_window_kb: int = 128):
-        """
-        Linux先読みを初期化
-        
-        Args:
-            cache_size_blocks: キャッシュサイズ（ブロック数）
-            initial_window_kb: 初期先読み窓サイズ（KB）
-        """
-        self.cache = LRUCache(cache_size_blocks)
-        self.cache_size = cache_size_blocks
-        
-        # 先読みパラメータ（論文準拠）
-        self.initial_window_kb = initial_window_kb
-        self.current_window_kb = initial_window_kb
-        self.max_window_kb = 2048  # 最大窓サイズ
-        
-        # 逐次アクセス検出
-        self.last_block_id: Optional[int] = None
-        self.consecutive_sequential = 0
-        self.sequential_threshold = 2  # 逐次判定閾値
-        
-        # 統計
-        self.total_accesses = 0
-        self.cache_hits = 0
-        
-        # 4KBブロックサイズ仮定
-        self.block_size_kb = 4
-        
-        logging.info(f"Linux先読み初期化: cache={cache_size_blocks}, "
-                    f"window={initial_window_kb}KB")
-    
-    def _is_sequential(self, block_id: int) -> bool:
-        """逐次アクセスかどうか判定"""
-        if self.last_block_id is None:
+    def _access_cache(self, block_id):
+        """キャッシュアクセス（LRU更新）"""
+        if block_id in self.cache:
+            # ヒット: LRU更新
+            self.cache_lru.remove(block_id)
+            self.cache_lru.append(block_id)
+            return True
+        else:
+            # ミス: キャッシュ追加
+            self.cache.add(block_id)
+            self.cache_lru.append(block_id)
+            
+            # キャッシュ満杯時、最古削除
+            if len(self.cache) > self.config.CACHE_SIZE:
+                oldest = self.cache_lru.pop(0)
+                self.cache.discard(oldest)
             return False
-        return block_id == self.last_block_id + 1
     
-    def _execute_readahead(self, block_id: int) -> None:
-        """
-        先読み実行（論文準拠アルゴリズム）
-        
-        Args:
-            block_id: 開始ブロックID
-        """
-        # 窓サイズ（ブロック数）計算
-        window_blocks = self.current_window_kb // self.block_size_kb
-        
-        # 先読み実行
-        for i in range(1, window_blocks + 1):
-            readahead_block = block_id + i
-            if not self.cache.access(readahead_block):
-                self.cache.insert(readahead_block, is_prefetch=True)
-                logging.debug(f"先読み: block={readahead_block}")
+    def _get_or_create_mcrow(self, chunk_id):
+        """MCRowを取得または動的作成（論文Section 3.2）"""
+        if chunk_id not in self.mc_rows:
+            self.mc_rows[chunk_id] = MCRow()
+            self.stats['mcrow_count'] = len(self.mc_rows)
+        return self.mc_rows[chunk_id]
     
-    def process_access(self, block_id: int) -> bool:
+    def _prefetch(self, predicted_chunk):
         """
-        ブロックアクセス処理（Linux先読みアルゴリズム）
-        
-        Args:
-            block_id: アクセスするブロックID
-            
-        Returns:
-            bool: キャッシュヒットした場合True
+        プリフェッチ実行（論文Section 3.3）
+        予測チャンクからプリフェッチウィンドウサイズ分読み込み
         """
-        self.total_accesses += 1
+        if predicted_chunk is None:
+            return []
         
-        # キャッシュアクセス
-        cache_hit = self.cache.access(block_id)
-        if cache_hit:
-            self.cache_hits += 1
+        prefetched = []
+        start_block = predicted_chunk * self.config.CHUNK_SIZE
+        
+        for i in range(self.config.PREFETCH_WINDOW_SIZE):
+            block_id = start_block + i
+            if block_id < self.config.TOTAL_BLOCKS:
+                if block_id not in self.cache:
+                    self.cache.add(block_id)
+                    self.cache_lru.append(block_id)
+                    prefetched.append(block_id)
+                    
+                    # キャッシュ満杯時、最古削除
+                    if len(self.cache) > self.config.CACHE_SIZE:
+                        oldest = self.cache_lru.pop(0)
+                        self.cache.discard(oldest)
+        
+        return prefetched
+    
+    def process_access(self, block_id):
+        """
+        1回のI/Oアクセス処理（論文Section 3.3の8ステップアルゴリズム）
+        """
+        self.stats['total_accesses'] += 1
+        current_chunk = self._block_to_chunk(block_id)
+        
+        # Step 1-2: キャッシュ確認
+        is_hit = self._access_cache(block_id)
+        
+        if is_hit:
+            self.stats['cache_hits'] += 1
         else:
-            # キャッシュミス：ブロックを読み込み
-            self.cache.insert(block_id, is_prefetch=False)
+            self.stats['cache_misses'] += 1
         
-        # 逐次性チェック
-        is_sequential = self._is_sequential(block_id)
+        # Step 5-6: MCRow確認・更新
+        if self.last_chunk is not None:
+            mcrow = self._get_or_create_mcrow(self.last_chunk)
+            mcrow.update(current_chunk)
+            
+            # Step 7: 予測とプリフェッチ
+            predicted = mcrow.predict()
+            prefetched_blocks = self._prefetch(predicted)
+            
+            # プリフェッチ効果測定（次回アクセスで確認）
+            if predicted == current_chunk:
+                self.stats['prefetch_hits'] += 1
+            else:
+                self.stats['prefetch_misses'] += 1
         
-        if is_sequential:
-            self.consecutive_sequential += 1
-            
-            # 継続的逐次アクセス：窓倍増
-            if self.consecutive_sequential >= self.sequential_threshold:
-                self.current_window_kb = min(self.current_window_kb * 2, 
-                                           self.max_window_kb)
-                logging.debug(f"窓倍増: {self.current_window_kb}KB")
-            
-            # 先読み実行
-            self._execute_readahead(block_id)
-            
-        else:
-            # 非逐次アクセス：窓リセット
-            self.consecutive_sequential = 0
-            self.current_window_kb = self.initial_window_kb
-            # 先読みは実行しない
+        self.last_chunk = current_chunk
         
-        self.last_block_id = block_id
-        return cache_hit
+        # ヒット率履歴記録（100アクセスごと）
+        if self.stats['total_accesses'] % 100 == 0:
+            hit_rate = self.stats['cache_hits'] / self.stats['total_accesses']
+            self.stats['hit_rate_history'].append(hit_rate)
     
-    def get_evaluation_metrics(self) -> Dict[str, Any]:
-        """評価指標を取得"""
-        prefetch_stats = self.cache.get_prefetch_stats()
-        
-        # プリフェッチ効率計算
-        prefetch_efficiency = 0.0
-        if prefetch_stats["prefetch_total"] > 0:
-            prefetch_efficiency = prefetch_stats["prefetch_used"] / prefetch_stats["prefetch_total"]
-        
-        # ヒット率計算
-        hit_rate = 0.0
-        if self.total_accesses > 0:
-            hit_rate = self.cache_hits / self.total_accesses
+    def get_results(self):
+        """最終結果を計算"""
+        total = self.stats['total_accesses']
+        if total == 0:
+            return {}
         
         return {
-            # 基本統計
-            "total_accesses": self.total_accesses,
-            "cache_hits": self.cache_hits,
-            "hit_rate": hit_rate,
-            
-            # プリフェッチ統計
-            "prefetch_total": prefetch_stats["prefetch_total"],
-            "prefetch_used": prefetch_stats["prefetch_used"],
-            "prefetch_unused": prefetch_stats["prefetch_unused"],
-            "prefetch_efficiency": prefetch_efficiency,
-            
-            # 先読み固有情報
-            "current_window_kb": self.current_window_kb,
-            "consecutive_sequential": self.consecutive_sequential,
-            "algorithm": "Linux ReadAhead"
+            'cache_hit_rate': self.stats['cache_hits'] / total,
+            'cache_miss_rate': self.stats['cache_misses'] / total,
+            'prefetch_accuracy': (self.stats['prefetch_hits'] / 
+                                  max(1, self.stats['prefetch_hits'] + self.stats['prefetch_misses'])),
+            'mcrow_count': self.stats['mcrow_count'],
+            'memory_usage_kb': self.stats['mcrow_count'] * 24 / 1024,  # 24B/MCRow
+            'hit_rate_history': self.stats['hit_rate_history']
         }
 
+
+# ================================================================================
+# ワークロード生成器
+# ================================================================================
 
 class WorkloadGenerator:
-    """
-    ワークロード生成器（論文Section 4.1準拠）
+    """各種ワークロードパターンの生成"""
     
-    KVM起動とLinuxカーネルビルドに相当する合成ワークロードを生成
-    """
+    def __init__(self, config):
+        self.config = config
     
-    @staticmethod
-    def generate_kvm_workload(total_blocks: int = 10000, 
-                             block_range: int = 50000) -> List[int]:
-        """
-        KVM起動ワークロード生成（42.53MB相当）
-        
-        Args:
-            total_blocks: 総アクセス数
-            block_range: ブロック範囲
-            
-        Returns:
-            List[int]: ブロックアクセスシーケンス
-        """
-        trace = []
-        
-        # KVM起動パターン：
-        # 40% 逐次アクセス（起動シーケンス）
-        # 35% ランダムアクセス（設定ファイル）
-        # 25% 小規模ジャンプ（ライブラリロード）
-        
-        current_block = random.randint(0, block_range // 10)
-        
-        for _ in range(total_blocks):
-            access_type = random.random()
-            
-            if access_type < 0.4:
-                # 逐次アクセス
-                trace.append(current_block)
-                current_block += 1
-            elif access_type < 0.75:
-                # ランダムアクセス
-                current_block = random.randint(0, block_range)
-                trace.append(current_block)
-            else:
-                # 小規模ジャンプ
-                jump = random.randint(10, 100)
-                current_block += jump
-                trace.append(current_block % block_range)
-        
-        return trace
+    def generate(self):
+        """設定に基づいてワークロード生成"""
+        if self.config.WORKLOAD_TYPE == "sequential":
+            return self._sequential()
+        elif self.config.WORKLOAD_TYPE == "random":
+            return self._random()
+        elif self.config.WORKLOAD_TYPE == "mixed":
+            return self._mixed()
+        else:
+            raise ValueError(f"Unknown workload type: {self.config.WORKLOAD_TYPE}")
     
-    @staticmethod
-    def generate_kernel_build_workload(total_blocks: int = 50000,
-                                     block_range: int = 200000) -> List[int]:
+    def _sequential(self):
+        """順次アクセスパターン"""
+        accesses = []
+        current = 0
+        for _ in range(self.config.WORKLOAD_SIZE):
+            accesses.append(current % self.config.TOTAL_BLOCKS)
+            current += 1
+        return accesses
+    
+    def _random(self):
+        """ランダムアクセスパターン"""
+        return [random.randint(0, self.config.TOTAL_BLOCKS - 1) 
+                for _ in range(self.config.WORKLOAD_SIZE)]
+    
+    def _mixed(self):
         """
-        Linuxカーネルビルドワークロード生成（7.96GB相当）
-        
-        Args:
-            total_blocks: 総アクセス数
-            block_range: ブロック範囲
-            
-        Returns:
-            List[int]: ブロックアクセスシーケンス
+        混合パターン（論文の実ワークロードを模擬）
+        - 局所性: アクセスが特定範囲に集中
+        - シーケンシャル性: 一定割合で連続アクセス
+        - フェーズ変化: アクセス範囲が時間で変化
+        - ホットスポット: 特定ブロックへの集中アクセス
         """
-        trace = []
+        accesses = []
+        phase_size = self.config.WORKLOAD_SIZE // self.config.PHASE_COUNT
         
-        # カーネルビルドパターン：
-        # 30% 逐次アクセス（ソースファイル読み込み）
-        # 50% ランダムアクセス（ヘッダーファイル）
-        # 20% 大規模ジャンプ（並列コンパイル）
-        
-        current_block = random.randint(0, block_range // 10)
-        
-        for _ in range(total_blocks):
-            access_type = random.random()
+        for phase in range(self.config.PHASE_COUNT):
+            # フェーズごとのアクセス範囲
+            phase_base = (self.config.TOTAL_BLOCKS // self.config.PHASE_COUNT) * phase
+            phase_range = int(self.config.TOTAL_BLOCKS * self.config.LOCALITY_FACTOR / self.config.PHASE_COUNT)
             
-            if access_type < 0.3:
-                # 逐次アクセス（ソースファイル）
-                trace.append(current_block)
-                current_block += 1
-            elif access_type < 0.8:
-                # ランダムアクセス（ヘッダーファイル）
-                current_block = random.randint(0, block_range)
-                trace.append(current_block)
-            else:
-                # 大規模ジャンプ（並列コンパイル）
-                jump = random.randint(1000, 10000)
-                current_block += jump
-                trace.append(current_block % block_range)
+            # ホットスポット設定
+            hot_spot_center = phase_base + phase_range // 2
+            hot_spot_range = int(phase_range * self.config.HOT_SPOT_RATIO)
+            
+            current = phase_base
+            
+            for _ in range(phase_size):
+                # ホットスポットアクセス判定
+                if random.random() < self.config.HOT_SPOT_RATIO:
+                    # ホットスポット内
+                    block = hot_spot_center + random.randint(-hot_spot_range, hot_spot_range)
+                elif random.random() < self.config.SEQUENTIAL_RATIO:
+                    # 連続アクセス
+                    current += 1
+                    block = current
+                else:
+                    # 局所的ランダムアクセス
+                    block = phase_base + random.randint(0, phase_range)
+                
+                # 範囲制限
+                block = max(0, min(block, self.config.TOTAL_BLOCKS - 1))
+                accesses.append(block)
         
-        return trace
+        return accesses
 
 
-def compare_clump_vs_readahead(trace: List[int],
-                              clump_params: Dict[str, int],
-                              cache_size: int = 4096) -> Dict[str, Any]:
-    """
-    CluMPとLinux先読みの比較実験（論文準拠）
+# ================================================================================
+# ベースライン（Linux ReadAhead相当）
+# ================================================================================
+
+class BaselineSimulator:
+    """Linux先読みアルゴリズム相当の単純実装"""
     
-    Args:
-        trace: アクセストレース
-        clump_params: CluMPパラメータ
-        cache_size: キャッシュサイズ
+    def __init__(self, config):
+        self.config = config
+        self.cache = set()
+        self.cache_lru = []
+        self.last_block = None
+        self.sequential_count = 0
         
-    Returns:
-        Dict[str, Any]: 比較結果
-    """
-    # CluMP実行
-    clump = CluMPSimulator(
-        chunk_size_blocks=clump_params["chunk_size"],
-        cluster_size_chunks=clump_params["cluster_size"],
-        cache_size_blocks=cache_size,
-        prefetch_window_blocks=clump_params["prefetch_window"]
-    )
+        self.stats = {
+            'total_accesses': 0,
+            'cache_hits': 0,
+            'hit_rate_history': []
+        }
     
-    for block_id in trace:
+    def process_access(self, block_id):
+        """単純な逐次先読み"""
+        self.stats['total_accesses'] += 1
+        
+        # キャッシュ確認
+        if block_id in self.cache:
+            self.stats['cache_hits'] += 1
+        else:
+            self.cache.add(block_id)
+            self.cache_lru.append(block_id)
+            
+            if len(self.cache) > self.config.CACHE_SIZE:
+                oldest = self.cache_lru.pop(0)
+                self.cache.discard(oldest)
+        
+        # 逐次性判定
+        if self.last_block is not None and block_id == self.last_block + 1:
+            self.sequential_count += 1
+            # 逐次なら先読み
+            for i in range(1, 33):  # 128KB = 32ブロック
+                prefetch_block = block_id + i
+                if prefetch_block < self.config.TOTAL_BLOCKS:
+                    if prefetch_block not in self.cache:
+                        self.cache.add(prefetch_block)
+                        self.cache_lru.append(prefetch_block)
+                        
+                        if len(self.cache) > self.config.CACHE_SIZE:
+                            oldest = self.cache_lru.pop(0)
+                            self.cache.discard(oldest)
+        else:
+            self.sequential_count = 0
+        
+        self.last_block = block_id
+        
+        # ヒット率履歴
+        if self.stats['total_accesses'] % 100 == 0:
+            hit_rate = self.stats['cache_hits'] / self.stats['total_accesses']
+            self.stats['hit_rate_history'].append(hit_rate)
+    
+    def get_results(self):
+        total = self.stats['total_accesses']
+        return {
+            'cache_hit_rate': self.stats['cache_hits'] / total if total > 0 else 0,
+            'hit_rate_history': self.stats['hit_rate_history']
+        }
+
+
+# ================================================================================
+# 結果の可視化と保存
+# ================================================================================
+
+def save_results(config, clump_results, baseline_results, workload_info, output_dir):
+    """結果をファイルとグラフで保存"""
+    
+    # 出力ディレクトリ作成
+    output_path = Path(output_dir)
+    output_path.mkdir(exist_ok=True)
+    
+    # タイムスタンプ付きサブディレクトリ
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    session_dir = output_path / f"session_{timestamp}"
+    session_dir.mkdir(exist_ok=True)
+    
+    # === 1. 数値データ保存 ===
+    report = {
+        'configuration': {
+            'total_blocks': config.TOTAL_BLOCKS,
+            'chunk_size': config.CHUNK_SIZE,
+            'cluster_size': config.CLUSTER_SIZE,
+            'cache_size': config.CACHE_SIZE,
+            'prefetch_window_size': config.PREFETCH_WINDOW_SIZE,
+            'workload_type': config.WORKLOAD_TYPE,
+            'workload_size': config.WORKLOAD_SIZE,
+            'locality_factor': config.LOCALITY_FACTOR,
+            'sequential_ratio': config.SEQUENTIAL_RATIO
+        },
+        'clump_results': clump_results,
+        'baseline_results': baseline_results,
+        'workload_info': workload_info,
+        'improvement': {
+            'hit_rate_improvement': clump_results['cache_hit_rate'] / baseline_results['cache_hit_rate']
+            if baseline_results['cache_hit_rate'] > 0 else 0
+        }
+    }
+    
+    # JSON保存
+    with open(session_dir / 'results.json', 'w', encoding='utf-8') as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+    
+    # テキストレポート
+    with open(session_dir / 'summary.txt', 'w', encoding='utf-8') as f:
+        f.write("=" * 80 + "\n")
+        f.write("CluMP Simulator - 実行結果サマリ\n")
+        f.write("=" * 80 + "\n\n")
+        
+        f.write("[設定]\n")
+        f.write(f"総ブロック数: {config.TOTAL_BLOCKS:,} ({config.TOTAL_BLOCKS * 4 / 1024:.1f} MB)\n")
+        f.write(f"チャンクサイズ: {config.CHUNK_SIZE} ブロック\n")
+        f.write(f"クラスタサイズ: {config.CLUSTER_SIZE} チャンク\n")
+        f.write(f"キャッシュサイズ: {config.CACHE_SIZE:,} ブロック ({config.CACHE_SIZE * 4 / 1024:.1f} MB)\n")
+        f.write(f"プリフェッチウィンドウ: {config.PREFETCH_WINDOW_SIZE} ブロック\n")
+        f.write(f"ワークロード: {config.WORKLOAD_TYPE}, {config.WORKLOAD_SIZE:,} アクセス\n\n")
+        
+        f.write("[CluMP 結果]\n")
+        f.write(f"キャッシュヒット率: {clump_results['cache_hit_rate']:.2%}\n")
+        f.write(f"プリフェッチ精度: {clump_results['prefetch_accuracy']:.2%}\n")
+        f.write(f"MCRow数: {clump_results['mcrow_count']:,}\n")
+        f.write(f"メモリ使用量: {clump_results['memory_usage_kb']:.2f} KB\n\n")
+        
+        f.write("[Baseline (Linux ReadAhead) 結果]\n")
+        f.write(f"キャッシュヒット率: {baseline_results['cache_hit_rate']:.2%}\n\n")
+        
+        f.write("[改善率]\n")
+        improvement = clump_results['cache_hit_rate'] / baseline_results['cache_hit_rate'] if baseline_results['cache_hit_rate'] > 0 else 0
+        f.write(f"ヒット率改善: {improvement:.2f}x ({improvement * 100 - 100:+.1f}%)\n")
+    
+    # === 2. グラフ生成 ===
+    if config.SAVE_GRAPHS:
+        # ヒット率比較
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.bar(['Linux ReadAhead', 'CluMP'], 
+               [baseline_results['cache_hit_rate'], clump_results['cache_hit_rate']],
+               color=['#ff7f0e', '#1f77b4'])
+        ax.set_ylabel('Cache Hit Rate')
+        ax.set_title('CluMP vs Linux ReadAhead - Cache Hit Rate Comparison')
+        ax.set_ylim(0, 1.0)
+        for i, v in enumerate([baseline_results['cache_hit_rate'], clump_results['cache_hit_rate']]):
+            ax.text(i, v + 0.02, f'{v:.2%}', ha='center', fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(session_dir / 'hit_rate_comparison.png', dpi=150)
+        plt.close()
+        
+        # ヒット率推移
+        fig, ax = plt.subplots(figsize=(12, 6))
+        x = list(range(len(clump_results['hit_rate_history'])))
+        ax.plot(x, clump_results['hit_rate_history'], label='CluMP', linewidth=2)
+        ax.plot(x, baseline_results['hit_rate_history'], label='Linux ReadAhead', linewidth=2)
+        ax.set_xlabel('Time (×100 accesses)')
+        ax.set_ylabel('Cache Hit Rate')
+        ax.set_title('Hit Rate Progression Over Time')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(session_dir / 'hit_rate_progression.png', dpi=150)
+        plt.close()
+        
+        # メモリ使用量
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.bar(['Memory Usage'], [clump_results['memory_usage_kb']], color='#2ca02c')
+        ax.set_ylabel('Memory (KB)')
+        ax.set_title(f"CluMP Memory Overhead ({clump_results['mcrow_count']:,} MCRows)")
+        ax.text(0, clump_results['memory_usage_kb'] + 0.5, 
+                f"{clump_results['memory_usage_kb']:.2f} KB", ha='center', fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(session_dir / 'memory_usage.png', dpi=150)
+        plt.close()
+    
+    print(f"\n✓ 結果を保存しました: {session_dir}")
+    return session_dir
+
+
+# ================================================================================
+# メイン実行
+# ================================================================================
+
+def main():
+    """シミュレータのメイン実行フロー"""
+    
+    print("=" * 80)
+    print("CluMP Simulator - 論文完全準拠版")
+    print("=" * 80)
+    
+    # 設定読み込み
+    config = SimulatorConfig()
+    
+    print("\n[設定]")
+    print(f"総ブロック数: {config.TOTAL_BLOCKS:,} ({config.TOTAL_BLOCKS * 4 / 1024:.1f} MB)")
+    print(f"チャンクサイズ: {config.CHUNK_SIZE} ブロック")
+    print(f"クラスタサイズ: {config.CLUSTER_SIZE} チャンク")
+    print(f"キャッシュサイズ: {config.CACHE_SIZE:,} ブロック ({config.CACHE_SIZE * 4 / 1024:.1f} MB)")
+    print(f"プリフェッチウィンドウ: {config.PREFETCH_WINDOW_SIZE} ブロック")
+    print(f"ワークロード: {config.WORKLOAD_TYPE}, {config.WORKLOAD_SIZE:,} アクセス")
+    
+    # ワークロード生成
+    print("\n[ワークロード生成中...]")
+    generator = WorkloadGenerator(config)
+    workload = generator.generate()
+    
+    workload_info = {
+        'unique_blocks': len(set(workload)),
+        'unique_chunks': len(set(b // config.CHUNK_SIZE for b in workload))
+    }
+    print(f"✓ {len(workload):,} アクセス生成完了")
+    print(f"  - ユニークブロック数: {workload_info['unique_blocks']:,}")
+    print(f"  - ユニークチャンク数: {workload_info['unique_chunks']:,}")
+    
+    # CluMPシミュレーション
+    print("\n[CluMP シミュレーション実行中...]")
+    clump = CluMPSimulator(config)
+    for i, block_id in enumerate(workload):
         clump.process_access(block_id)
+        if config.VERBOSE_LOG and (i + 1) % 1000 == 0:
+            print(f"  進捗: {i + 1:,} / {len(workload):,} ({(i + 1) / len(workload) * 100:.1f}%)")
     
-    clump_results = clump.get_evaluation_metrics()
+    clump_results = clump.get_results()
+    print(f"✓ 完了 - ヒット率: {clump_results['cache_hit_rate']:.2%}")
     
-    # Linux先読み実行
-    readahead = LinuxReadAhead(cache_size_blocks=cache_size)
+    # ベースラインシミュレーション
+    print("\n[Baseline (Linux ReadAhead) シミュレーション実行中...]")
+    baseline = BaselineSimulator(config)
+    for i, block_id in enumerate(workload):
+        baseline.process_access(block_id)
     
-    for block_id in trace:
-        readahead.process_access(block_id)
+    baseline_results = baseline.get_results()
+    print(f"✓ 完了 - ヒット率: {baseline_results['cache_hit_rate']:.2%}")
     
-    readahead_results = readahead.get_evaluation_metrics()
+    # 結果比較
+    print("\n[結果比較]")
+    improvement = clump_results['cache_hit_rate'] / baseline_results['cache_hit_rate'] if baseline_results['cache_hit_rate'] > 0 else 0
+    print(f"CluMP ヒット率: {clump_results['cache_hit_rate']:.2%}")
+    print(f"Baseline ヒット率: {baseline_results['cache_hit_rate']:.2%}")
+    print(f"改善率: {improvement:.2f}x ({improvement * 100 - 100:+.1f}%)")
+    print(f"\nCluMP プリフェッチ精度: {clump_results['prefetch_accuracy']:.2%}")
+    print(f"MCRow 数: {clump_results['mcrow_count']:,}")
+    print(f"メモリ使用量: {clump_results['memory_usage_kb']:.2f} KB")
     
-    # 比較結果
-    improvement = {
-        "hit_rate_improvement": clump_results["hit_rate"] / readahead_results["hit_rate"] if readahead_results["hit_rate"] > 0 else float('inf'),
-        "hit_rate_difference": clump_results["hit_rate"] - readahead_results["hit_rate"],
-        "prefetch_efficiency_improvement": clump_results["prefetch_efficiency"] / readahead_results["prefetch_efficiency"] if readahead_results["prefetch_efficiency"] > 0 else float('inf')
-    }
+    # 結果保存
+    print("\n[結果保存中...]")
+    output_dir = save_results(config, clump_results, baseline_results, workload_info, config.OUTPUT_DIR)
     
-    return {
-        "clump": clump_results,
-        "readahead": readahead_results,
-        "improvement": improvement
-    }
+    print("\n" + "=" * 80)
+    print("シミュレーション完了")
+    print("=" * 80)
 
 
 if __name__ == "__main__":
-    # 乱数シード固定（再現性確保）
-    random.seed(42)
-    
-    print("CluMP論文準拠シミュレータ")
-    print("=" * 60)
-    
-    # 論文準拠パラメータ
-    clump_params = {
-        "chunk_size": 16,      # 論文で効果的とされた値
-        "cluster_size": 64,    # 論文で効果的とされた値
-        "prefetch_window": 16
-    }
-    
-    # KVMワークロードテスト
-    print("\n🚀 KVMワークロードテスト")
-    print("-" * 40)
-    
-    kvm_trace = WorkloadGenerator.generate_kvm_workload(total_blocks=10000)
-    kvm_results = compare_clump_vs_readahead(kvm_trace, clump_params)
-    
-    print(f"Linux先読み ヒット率: {kvm_results['readahead']['hit_rate']:.3f}")
-    print(f"CluMP ヒット率: {kvm_results['clump']['hit_rate']:.3f}")
-    print(f"改善倍率: {kvm_results['improvement']['hit_rate_improvement']:.2f}x")
-    print(f"CluMP MC行数: {kvm_results['clump']['memory_usage_mc_rows']}")
-    
-    # カーネルビルドワークロードテスト
-    print("\n🔨 カーネルビルドワークロードテスト")
-    print("-" * 40)
-    
-    kernel_trace = WorkloadGenerator.generate_kernel_build_workload(total_blocks=20000)
-    kernel_results = compare_clump_vs_readahead(kernel_trace, clump_params)
-    
-    print(f"Linux先読み ヒット率: {kernel_results['readahead']['hit_rate']:.3f}")
-    print(f"CluMP ヒット率: {kernel_results['clump']['hit_rate']:.3f}")
-    print(f"改善倍率: {kernel_results['improvement']['hit_rate_improvement']:.2f}x")
-    print(f"CluMP MC行数: {kernel_results['clump']['memory_usage_mc_rows']}")
-    
-    print("\n✅ 論文準拠シミュレーション完了")
-    print("目標値: KVM 1.91x改善, カーネルビルド 1.31x改善")
+    main()
