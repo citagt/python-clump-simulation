@@ -71,13 +71,13 @@ class SimulatorConfig:
     """
     
     # === 基本パラメータ（論文Section 3.2, 4.1） ===
-    TOTAL_BLOCKS = 50000           # 総ブロック数（例: 200MB相当、4KB/ブロック）
+    TOTAL_BLOCKS = 10888           # 総ブロック数（例: 200MB相当、4KB/ブロック）
                                     # 論文: KVM=10,888, カーネルビルド=2,086,048
     
-    CHUNK_SIZE = 4                 # チャンクサイズ（ブロック数/チャンク）
+    CHUNK_SIZE = 16                 # チャンクサイズ（ブロック数/チャンク）
                                     # 論文Section 4: 8, 16, 32, 64, 128, 256を評価
     
-    CLUSTER_SIZE = 64              # クラスタサイズ（チャンク数/クラスタ）
+    CLUSTER_SIZE = 32              # クラスタサイズ（チャンク数/クラスタ）
                                     # 論文Section 4: 16, 32, 64, 128を評価
                                     # メモリ使用量計算に使用
     
@@ -87,7 +87,7 @@ class SimulatorConfig:
                                     # 計算: 2GB ÷ 4KB = 524,288ブロック
     
     # === プリフェッチ設定（論文Section 3.3） ===
-    PREFETCH_WINDOW_SIZE = 8       # プリフェッチウィンドウ（ブロック数）
+    PREFETCH_WINDOW_SIZE = 16       # プリフェッチウィンドウ（ブロック数）
                                     # 論文: "prefetch window size that can be 
                                     # defined by the user" - 単位は明記されていないが
                                     # ブロック単位が妥当（Linux RAは128KB=32ブロック）
@@ -96,13 +96,13 @@ class SimulatorConfig:
     # === ワークロード設定 ===
     WORKLOAD_TYPE = "mixed"        # "sequential", "random", "mixed"
                                     # 論文は実トレース使用、本実装は合成ワークロード
-    WORKLOAD_SIZE = 10000          # I/Oアクセス回数
+    WORKLOAD_SIZE = 10888          # I/Oアクセス回数
     
     # === 高度なワークロード設定（mixedモード用） ===
-    LOCALITY_FACTOR = 0.7          # 局所性 (0.0-1.0): 高いほどアクセスが集中
-    SEQUENTIAL_RATIO = 0.3         # 連続アクセス割合 (0.0-1.0)
-    PHASE_COUNT = 3                # アクセスパターンの変化回数
-    HOT_SPOT_RATIO = 0.2           # ホットスポット集中度 (0.0-1.0)
+    LOCALITY_FACTOR = 0.8          # 局所性 (0.0-1.0): 高いほどアクセスが集中
+    SEQUENTIAL_RATIO = 0.4         # 連続アクセス割合 (0.0-1.0)
+    PHASE_COUNT = 5                # アクセスパターンの変化回数
+    HOT_SPOT_RATIO = 0.3           # ホットスポット集中度 (0.0-1.0)
     
     # === 出力設定 ===
     OUTPUT_DIR = "output"          # 出力ディレクトリ名
@@ -223,8 +223,8 @@ class CluMPSimulator:
     論文Section 3.3の8ステップアルゴリズム完全実装
     
     【重要な設計判断】
-    - プリフェッチ精度: 直前の予測(t-1で予測したチャンク)が現在のアクセス(t)と
-      一致するかで評価（論文の意図に準拠）
+    - プリフェッチ精度: プリフェッチされた全ブロックのうち実際に使用された
+      ブロックの割合を測定（論文Section 4の定義に完全準拠）
     - MCRow更新: チャンクC(前回)→チャンクN(今回)の遷移を記録
     """
     
@@ -238,21 +238,27 @@ class CluMPSimulator:
         self.cache = set()
         self.cache_lru = []  # アクセス順記録
         
+        # プリフェッチ追跡（論文Section 4.3準拠）
+        self.prefetched_blocks = set()      # プリフェッチされたブロック
+        self.prefetch_metadata = {}         # {block_id: issue_time}
+        self.prefetch_window_counter = 0    # プリフェッチウィンドウのタイムスタンプ
+        
         # 統計情報
         self.stats = {
             'total_accesses': 0,
             'cache_hits': 0,
             'cache_misses': 0,
-            'prefetch_hits': 0,        # プリフェッチが使用された回数
-            'prefetch_misses': 0,      # プリフェッチが無駄だった回数
-            'prefetch_issued': 0,      # プリフェッチ実行回数
+            'prefetch_blocks_used': 0,        # 使用されたプリフェッチブロック数
+            'prefetch_blocks_wasted': 0,      # 無駄だったプリフェッチブロック数
+            'prefetch_blocks_total': 0,       # プリフェッチした総ブロック数
+            'prefetch_issued': 0,             # プリフェッチ実行回数
             'mcrow_count': 0,
-            'hit_rate_history': []
+            'hit_rate_history': [],
+            'prefetch_accuracy_history': []   # プリフェッチ精度の推移
         }
         
         # 前回の状態（論文の遷移記録に必要）
         self.last_chunk = None           # 直前にアクセスしたチャンク
-        self.last_predicted_chunk = None # 直前に予測したチャンク
     
     def _block_to_chunk(self, block_id):
         """ブロック番号からチャンク番号へ変換（Section 3.2）"""
@@ -295,6 +301,9 @@ class CluMPSimulator:
         "Once the predicted chunk is determined in CluMP, prefetching is 
         performed with a prefetch window size that can be defined by the user."
         
+        【プリフェッチ追跡】（論文Section 4.3準拠）
+        プリフェッチされた各ブロックを記録し、後続のアクセスで使用率を測定。
+        
         戻り値: プリフェッチされたブロックIDのリスト
         """
         if predicted_chunk is None:
@@ -302,6 +311,7 @@ class CluMPSimulator:
         
         prefetched = []
         start_block = predicted_chunk * self.config.CHUNK_SIZE
+        self.prefetch_window_counter += 1  # 新しいプリフェッチウィンドウ
         
         for i in range(self.config.PREFETCH_WINDOW_SIZE):
             block_id = start_block + i
@@ -311,12 +321,38 @@ class CluMPSimulator:
                     self.cache_lru.append(block_id)
                     prefetched.append(block_id)
                     
+                    # プリフェッチ追跡情報を記録
+                    self.prefetched_blocks.add(block_id)
+                    self.prefetch_metadata[block_id] = self.prefetch_window_counter
+                    
                     # キャッシュ満杯時、最古削除
                     if len(self.cache) > self.config.CACHE_SIZE:
                         oldest = self.cache_lru.pop(0)
                         self.cache.discard(oldest)
+                        # キャッシュから追い出されたブロックの処理
+                        self._handle_cache_eviction(oldest)
         
         return prefetched
+    
+    def _handle_cache_eviction(self, block_id):
+        """
+        キャッシュから追い出されたブロックの処理
+        
+        【論文Section 4.3のミスプリフェッチ測定】
+        プリフェッチされたが使われずにキャッシュから追い出された
+        ブロックを「無駄なプリフェッチ」としてカウント。
+        
+        論文記載:
+        "A missed prefetch refers to the blocks that were prefetched from 
+        the disk to the memory based on the prefetch algorithm and mechanism 
+        but that were not actually utilized."
+        """
+        if block_id in self.prefetched_blocks:
+            # プリフェッチされたが使われずに追い出された
+            self.stats['prefetch_blocks_wasted'] += 1
+            self.prefetched_blocks.discard(block_id)
+            if block_id in self.prefetch_metadata:
+                del self.prefetch_metadata[block_id]
     
     def process_access(self, block_id):
         """
@@ -331,13 +367,25 @@ class CluMPSimulator:
         7. 更新されたMCRowの予測に基づきプリフェッチ実行
         8. MCRow不在時、新規作成
         
-        【重要な修正点】
-        プリフェッチ精度の測定:
-          - 直前(t-1)に予測したチャンクと今回(t)のアクセスチャンクを比較
-          - これにより「予測が次のアクセスで的中したか」を正しく評価
+        【論文Section 4準拠のプリフェッチ精度測定】
+        プリフェッチされたブロックのうち、実際に使用されたブロックの
+        割合を測定。これは「プリフェッチされたデータの実使用率」として
+        論文で定義されている指標。
+        
+        論文記載:
+        "Prefetch Accuracy: The actual usage rate of prefetched data"
         """
         self.stats['total_accesses'] += 1
         current_chunk = self._block_to_chunk(block_id)
+        
+        # 【論文Section 4.3準拠】プリフェッチ精度評価
+        # このブロックが事前にプリフェッチされていたかチェック
+        if block_id in self.prefetched_blocks:
+            # プリフェッチが使用された！
+            self.stats['prefetch_blocks_used'] += 1
+            self.prefetched_blocks.discard(block_id)
+            if block_id in self.prefetch_metadata:
+                del self.prefetch_metadata[block_id]
         
         # Step 1-2: キャッシュ確認（メモリ内のデータ存在チェック）
         is_hit = self._access_cache(block_id)
@@ -347,14 +395,6 @@ class CluMPSimulator:
         else:
             # Step 3-4: ミス時、ディスクから読み取りメモリに読み込み
             self.stats['cache_misses'] += 1
-        
-        # 【論文準拠の修正】プリフェッチ精度評価
-        # 直前(t-1)の予測が今回(t)のアクセスと一致したかを評価
-        if self.last_predicted_chunk is not None:
-            if self.last_predicted_chunk == current_chunk:
-                self.stats['prefetch_hits'] += 1
-            else:
-                self.stats['prefetch_misses'] += 1
         
         # Step 5-6: MCRowの確認と更新
         # 前回チャンク → 現在チャンクの遷移を記録
@@ -370,14 +410,10 @@ class CluMPSimulator:
             
             # プリフェッチ実行
             if predicted_chunk is not None:
-                self._prefetch(predicted_chunk)
-                self.stats['prefetch_issued'] += 1
-            
-            # 今回の予測を記録（次回のプリフェッチ精度評価に使用）
-            self.last_predicted_chunk = predicted_chunk
-        else:
-            # 初回アクセス時は予測なし
-            self.last_predicted_chunk = None
+                prefetched_blocks = self._prefetch(predicted_chunk)
+                if len(prefetched_blocks) > 0:
+                    self.stats['prefetch_issued'] += 1
+                    self.stats['prefetch_blocks_total'] += len(prefetched_blocks)
         
         # 今回のチャンクを記録（次回の遷移記録に使用）
         self.last_chunk = current_chunk
@@ -386,27 +422,46 @@ class CluMPSimulator:
         if self.stats['total_accesses'] % 100 == 0:
             hit_rate = self.stats['cache_hits'] / self.stats['total_accesses']
             self.stats['hit_rate_history'].append(hit_rate)
+            
+            # プリフェッチ精度履歴も記録
+            if self.stats['prefetch_blocks_total'] > 0:
+                accuracy = self.stats['prefetch_blocks_used'] / self.stats['prefetch_blocks_total']
+                self.stats['prefetch_accuracy_history'].append(accuracy)
     
     def get_results(self):
-        """最終結果を計算"""
+        """
+        最終結果を計算
+        
+        【論文Section 4準拠のプリフェッチ精度】
+        プリフェッチ精度 = 使用されたプリフェッチブロック数 / 総プリフェッチブロック数
+        
+        これは論文の定義「プリフェッチされたデータの実使用率」に完全準拠。
+        """
         total = self.stats['total_accesses']
         if total == 0:
             return {}
         
-        # プリフェッチ精度: プリフェッチが実際に使用された割合
-        prefetch_total = self.stats['prefetch_hits'] + self.stats['prefetch_misses']
+        # 【論文準拠】プリフェッチ精度: 使用されたブロック / 総プリフェッチブロック
+        prefetch_total = self.stats['prefetch_blocks_total']
+        prefetch_accuracy = (self.stats['prefetch_blocks_used'] / prefetch_total 
+                            if prefetch_total > 0 else 0)
+        
+        # 残っているプリフェッチブロック（未使用）を無駄としてカウント
+        remaining_prefetch = len(self.prefetched_blocks)
+        total_wasted = self.stats['prefetch_blocks_wasted'] + remaining_prefetch
         
         return {
             'cache_hit_rate': self.stats['cache_hits'] / total,
             'cache_miss_rate': self.stats['cache_misses'] / total,
-            'prefetch_accuracy': (self.stats['prefetch_hits'] / prefetch_total 
-                                  if prefetch_total > 0 else 0),
-            'prefetch_hits': self.stats['prefetch_hits'],
-            'prefetch_misses': self.stats['prefetch_misses'],
+            'prefetch_accuracy': prefetch_accuracy,
+            'prefetch_blocks_used': self.stats['prefetch_blocks_used'],
+            'prefetch_blocks_wasted': total_wasted,
+            'prefetch_blocks_total': prefetch_total,
             'prefetch_issued': self.stats['prefetch_issued'],
             'mcrow_count': self.stats['mcrow_count'],
             'memory_usage_kb': self.stats['mcrow_count'] * 24 / 1024,  # 24B/MCRow
-            'hit_rate_history': self.stats['hit_rate_history']
+            'hit_rate_history': self.stats['hit_rate_history'],
+            'prefetch_accuracy_history': self.stats['prefetch_accuracy_history']
         }
 
 
@@ -644,9 +699,10 @@ def save_results(config, clump_results, baseline_results, workload_info, output_
         f.write("[CluMP 結果]\n")
         f.write(f"キャッシュヒット率: {clump_results['cache_hit_rate']:.2%}\n")
         f.write(f"プリフェッチ精度: {clump_results['prefetch_accuracy']:.2%}\n")
+        f.write(f"  - 使用されたブロック: {clump_results['prefetch_blocks_used']:,}\n")
+        f.write(f"  - 無駄だったブロック: {clump_results['prefetch_blocks_wasted']:,}\n")
+        f.write(f"  - 総プリフェッチブロック: {clump_results['prefetch_blocks_total']:,}\n")
         f.write(f"プリフェッチ実行回数: {clump_results['prefetch_issued']:,}\n")
-        f.write(f"プリフェッチヒット: {clump_results['prefetch_hits']:,}\n")
-        f.write(f"プリフェッチミス: {clump_results['prefetch_misses']:,}\n")
         f.write(f"MCRow数: {clump_results['mcrow_count']:,}\n")
         f.write(f"メモリ使用量: {clump_results['memory_usage_kb']:.2f} KB\n\n")
         
@@ -764,9 +820,10 @@ def main():
     print(f"Baseline ヒット率: {baseline_results['cache_hit_rate']:.2%}")
     print(f"改善率: {improvement:.2f}x ({improvement * 100 - 100:+.1f}%)")
     print(f"\nCluMP プリフェッチ精度: {clump_results['prefetch_accuracy']:.2%}")
+    print(f"  - 使用されたブロック: {clump_results['prefetch_blocks_used']:,}")
+    print(f"  - 無駄だったブロック: {clump_results['prefetch_blocks_wasted']:,}")
+    print(f"  - 総プリフェッチブロック: {clump_results['prefetch_blocks_total']:,}")
     print(f"プリフェッチ実行回数: {clump_results['prefetch_issued']:,}")
-    print(f"プリフェッチヒット: {clump_results['prefetch_hits']:,}")
-    print(f"プリフェッチミス: {clump_results['prefetch_misses']:,}")
     print(f"MCRow 数: {clump_results['mcrow_count']:,}")
     print(f"メモリ使用量: {clump_results['memory_usage_kb']:.2f} KB")
     
