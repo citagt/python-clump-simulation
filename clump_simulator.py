@@ -587,15 +587,32 @@ class BaselineSimulator:
         self.last_block = None
         self.sequential_count = 0
         
+        # プリフェッチ追跡（CluMPと同様）
+        self.prefetched_blocks = set()
+        self.prefetch_metadata = {}
+        self.prefetch_window_counter = 0
+        
         self.stats = {
             'total_accesses': 0,
             'cache_hits': 0,
-            'hit_rate_history': []
+            'prefetch_blocks_used': 0,
+            'prefetch_blocks_wasted': 0,
+            'prefetch_blocks_total': 0,
+            'prefetch_issued': 0,
+            'hit_rate_history': [],
+            'prefetch_accuracy_history': []
         }
     
     def process_access(self, block_id):
-        """単純な逐次先読み"""
+        """単純な逐次先読み（プリフェッチ精度測定付き）"""
         self.stats['total_accesses'] += 1
+        
+        # プリフェッチ精度評価：このブロックがプリフェッチされていたかチェック
+        if block_id in self.prefetched_blocks:
+            self.stats['prefetch_blocks_used'] += 1
+            self.prefetched_blocks.discard(block_id)
+            if block_id in self.prefetch_metadata:
+                del self.prefetch_metadata[block_id]
         
         # キャッシュ確認
         if block_id in self.cache:
@@ -607,11 +624,14 @@ class BaselineSimulator:
             if len(self.cache) > self.config.CACHE_SIZE:
                 oldest = self.cache_lru.pop(0)
                 self.cache.discard(oldest)
+                self._handle_cache_eviction(oldest)
         
         # 逐次性判定
         if self.last_block is not None and block_id == self.last_block + 1:
             self.sequential_count += 1
             # 逐次なら先読み
+            self.prefetch_window_counter += 1
+            prefetch_count = 0
             for i in range(1, 33):  # 128KB = 32ブロック
                 prefetch_block = block_id + i
                 if prefetch_block < self.config.TOTAL_BLOCKS:
@@ -619,9 +639,19 @@ class BaselineSimulator:
                         self.cache.add(prefetch_block)
                         self.cache_lru.append(prefetch_block)
                         
+                        # プリフェッチ追跡
+                        self.prefetched_blocks.add(prefetch_block)
+                        self.prefetch_metadata[prefetch_block] = self.prefetch_window_counter
+                        prefetch_count += 1
+                        
                         if len(self.cache) > self.config.CACHE_SIZE:
                             oldest = self.cache_lru.pop(0)
                             self.cache.discard(oldest)
+                            self._handle_cache_eviction(oldest)
+            
+            if prefetch_count > 0:
+                self.stats['prefetch_issued'] += 1
+                self.stats['prefetch_blocks_total'] += prefetch_count
         else:
             self.sequential_count = 0
         
@@ -631,12 +661,44 @@ class BaselineSimulator:
         if self.stats['total_accesses'] % 100 == 0:
             hit_rate = self.stats['cache_hits'] / self.stats['total_accesses']
             self.stats['hit_rate_history'].append(hit_rate)
+            
+            # プリフェッチ精度履歴も記録
+            if self.stats['prefetch_blocks_total'] > 0:
+                accuracy = self.stats['prefetch_blocks_used'] / self.stats['prefetch_blocks_total']
+                self.stats['prefetch_accuracy_history'].append(accuracy)
+    
+    def _handle_cache_eviction(self, block_id):
+        """キャッシュから追い出されたブロックの処理"""
+        if block_id in self.prefetched_blocks:
+            # プリフェッチされたが使われずに追い出された
+            self.stats['prefetch_blocks_wasted'] += 1
+            self.prefetched_blocks.discard(block_id)
+            if block_id in self.prefetch_metadata:
+                del self.prefetch_metadata[block_id]
     
     def get_results(self):
         total = self.stats['total_accesses']
+        if total == 0:
+            return {}
+        
+        # プリフェッチ精度計算
+        prefetch_total = self.stats['prefetch_blocks_total']
+        prefetch_accuracy = (self.stats['prefetch_blocks_used'] / prefetch_total 
+                            if prefetch_total > 0 else 0)
+        
+        # 残っているプリフェッチブロック（未使用）を無駄としてカウント
+        remaining_prefetch = len(self.prefetched_blocks)
+        total_wasted = self.stats['prefetch_blocks_wasted'] + remaining_prefetch
+        
         return {
-            'cache_hit_rate': self.stats['cache_hits'] / total if total > 0 else 0,
-            'hit_rate_history': self.stats['hit_rate_history']
+            'cache_hit_rate': self.stats['cache_hits'] / total,
+            'prefetch_accuracy': prefetch_accuracy,
+            'prefetch_blocks_used': self.stats['prefetch_blocks_used'],
+            'prefetch_blocks_wasted': total_wasted,
+            'prefetch_blocks_total': prefetch_total,
+            'prefetch_issued': self.stats['prefetch_issued'],
+            'hit_rate_history': self.stats['hit_rate_history'],
+            'prefetch_accuracy_history': self.stats['prefetch_accuracy_history']
         }
 
 
@@ -707,7 +769,12 @@ def save_results(config, clump_results, baseline_results, workload_info, output_
         f.write(f"メモリ使用量: {clump_results['memory_usage_kb']:.2f} KB\n\n")
         
         f.write("[Baseline (Linux ReadAhead) 結果]\n")
-        f.write(f"キャッシュヒット率: {baseline_results['cache_hit_rate']:.2%}\n\n")
+        f.write(f"キャッシュヒット率: {baseline_results['cache_hit_rate']:.2%}\n")
+        f.write(f"プリフェッチ精度: {baseline_results['prefetch_accuracy']:.2%}\n")
+        f.write(f"  - 使用されたブロック: {baseline_results['prefetch_blocks_used']:,}\n")
+        f.write(f"  - 無駄だったブロック: {baseline_results['prefetch_blocks_wasted']:,}\n")
+        f.write(f"  - 総プリフェッチブロック: {baseline_results['prefetch_blocks_total']:,}\n")
+        f.write(f"プリフェッチ実行回数: {baseline_results['prefetch_issued']:,}\n\n")
         
         f.write("[改善率]\n")
         improvement = clump_results['cache_hit_rate'] / baseline_results['cache_hit_rate'] if baseline_results['cache_hit_rate'] > 0 else 0
@@ -729,6 +796,20 @@ def save_results(config, clump_results, baseline_results, workload_info, output_
         plt.savefig(session_dir / 'hit_rate_comparison.png', dpi=150)
         plt.close()
         
+        # プリフェッチ精度比較
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.bar(['Linux ReadAhead', 'CluMP'], 
+               [baseline_results['prefetch_accuracy'], clump_results['prefetch_accuracy']],
+               color=['#ff7f0e', '#1f77b4'])
+        ax.set_ylabel('Prefetch Accuracy')
+        ax.set_title('CluMP vs Linux ReadAhead - Prefetch Accuracy Comparison')
+        ax.set_ylim(0, 1.0)
+        for i, v in enumerate([baseline_results['prefetch_accuracy'], clump_results['prefetch_accuracy']]):
+            ax.text(i, v + 0.02, f'{v:.2%}', ha='center', fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(session_dir / 'prefetch_accuracy_comparison.png', dpi=150)
+        plt.close()
+        
         # ヒット率推移
         fig, ax = plt.subplots(figsize=(12, 6))
         x = list(range(len(clump_results['hit_rate_history'])))
@@ -742,6 +823,30 @@ def save_results(config, clump_results, baseline_results, workload_info, output_
         plt.tight_layout()
         plt.savefig(session_dir / 'hit_rate_progression.png', dpi=150)
         plt.close()
+        
+        # プリフェッチ精度推移（両者の比較）
+        if len(clump_results['prefetch_accuracy_history']) > 0 or len(baseline_results['prefetch_accuracy_history']) > 0:
+            fig, ax = plt.subplots(figsize=(12, 6))
+            
+            if len(clump_results['prefetch_accuracy_history']) > 0:
+                x_clump = list(range(len(clump_results['prefetch_accuracy_history'])))
+                ax.plot(x_clump, clump_results['prefetch_accuracy_history'], 
+                       label='CluMP', linewidth=2, color='#1f77b4')
+            
+            if len(baseline_results['prefetch_accuracy_history']) > 0:
+                x_baseline = list(range(len(baseline_results['prefetch_accuracy_history'])))
+                ax.plot(x_baseline, baseline_results['prefetch_accuracy_history'], 
+                       label='Linux ReadAhead', linewidth=2, color='#ff7f0e')
+            
+            ax.set_xlabel('Time (×100 accesses)')
+            ax.set_ylabel('Prefetch Accuracy')
+            ax.set_title('Prefetch Accuracy Progression Over Time')
+            ax.set_ylim(0, 1.0)
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(session_dir / 'prefetch_accuracy_progression.png', dpi=150)
+            plt.close()
         
         # メモリ使用量
         fig, ax = plt.subplots(figsize=(8, 6))
@@ -815,17 +920,32 @@ def main():
     
     # 結果比較
     print("\n[結果比較]")
-    improvement = clump_results['cache_hit_rate'] / baseline_results['cache_hit_rate'] if baseline_results['cache_hit_rate'] > 0 else 0
-    print(f"CluMP ヒット率: {clump_results['cache_hit_rate']:.2%}")
-    print(f"Baseline ヒット率: {baseline_results['cache_hit_rate']:.2%}")
-    print(f"改善率: {improvement:.2f}x ({improvement * 100 - 100:+.1f}%)")
-    print(f"\nCluMP プリフェッチ精度: {clump_results['prefetch_accuracy']:.2%}")
-    print(f"  - 使用されたブロック: {clump_results['prefetch_blocks_used']:,}")
-    print(f"  - 無駄だったブロック: {clump_results['prefetch_blocks_wasted']:,}")
-    print(f"  - 総プリフェッチブロック: {clump_results['prefetch_blocks_total']:,}")
+    hit_improvement = clump_results['cache_hit_rate'] / baseline_results['cache_hit_rate'] if baseline_results['cache_hit_rate'] > 0 else 0
+    print(f"\n=== キャッシュヒット率 ===")
+    print(f"CluMP: {clump_results['cache_hit_rate']:.2%}")
+    print(f"Baseline: {baseline_results['cache_hit_rate']:.2%}")
+    print(f"改善率: {hit_improvement:.2f}x ({hit_improvement * 100 - 100:+.1f}%)")
+    
+    print(f"\n=== プリフェッチ精度 ===")
+    print(f"CluMP: {clump_results['prefetch_accuracy']:.2%}")
+    print(f"Baseline: {baseline_results['prefetch_accuracy']:.2%}")
+    if baseline_results['prefetch_accuracy'] > 0:
+        accuracy_improvement = clump_results['prefetch_accuracy'] / baseline_results['prefetch_accuracy']
+        print(f"改善率: {accuracy_improvement:.2f}x ({accuracy_improvement * 100 - 100:+.1f}%)")
+    
+    print(f"\n=== CluMP 詳細 ===")
+    print(f"プリフェッチ使用ブロック: {clump_results['prefetch_blocks_used']:,}")
+    print(f"プリフェッチ無駄ブロック: {clump_results['prefetch_blocks_wasted']:,}")
+    print(f"総プリフェッチブロック: {clump_results['prefetch_blocks_total']:,}")
     print(f"プリフェッチ実行回数: {clump_results['prefetch_issued']:,}")
-    print(f"MCRow 数: {clump_results['mcrow_count']:,}")
+    print(f"MCRow数: {clump_results['mcrow_count']:,}")
     print(f"メモリ使用量: {clump_results['memory_usage_kb']:.2f} KB")
+    
+    print(f"\n=== Baseline 詳細 ===")
+    print(f"プリフェッチ使用ブロック: {baseline_results['prefetch_blocks_used']:,}")
+    print(f"プリフェッチ無駄ブロック: {baseline_results['prefetch_blocks_wasted']:,}")
+    print(f"総プリフェッチブロック: {baseline_results['prefetch_blocks_total']:,}")
+    print(f"プリフェッチ実行回数: {baseline_results['prefetch_issued']:,}")
     
     # 結果保存
     print("\n[結果保存中...]")
