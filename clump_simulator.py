@@ -104,6 +104,10 @@ class SimulatorConfig:
     PHASE_COUNT = 5                # アクセスパターンの変化回数
     HOT_SPOT_RATIO = 0.3           # ホットスポット集中度 (0.0-1.0)
     
+    # === 改良版CluMPパラメータ ===
+    ALPHA_THRESHOLD = 0.5          # CN2を含める閾値（P2/P1 >= α）
+    BETA_THRESHOLD = 0.3           # CN3を含める閾値（P3/P1 >= β）
+    
     # === 出力設定 ===
     OUTPUT_DIR = "output"          # 出力ディレクトリ名
     VERBOSE_LOG = True             # 詳細ログ出力
@@ -212,6 +216,40 @@ class MCRow:
         戻り値: CN1のチャンク番号 (P1>0の場合)、未初期化時はNone
         """
         return self.CN1 if self.P1 > 0 else None
+    
+    def predict_multi(self, alpha_threshold, beta_threshold):
+        """
+        【改良版】複数候補予測メカニズム
+        
+        信頼度比率に基づいてCN1, CN2, CN3から予測候補を選択。
+        
+        アルゴリズム:
+          1. CN1は常に含める（P1 > 0の場合）
+          2. P2/P1 >= α なら CN2を追加
+          3. P3/P1 >= β なら CN3を追加
+        
+        引数:
+          alpha_threshold: CN2を含める閾値
+          beta_threshold: CN3を含める閾値
+        
+        戻り値: 予測チャンク番号のリスト
+        """
+        if self.P1 == 0:
+            return []
+        
+        candidates = [self.CN1]  # CN1は必ず含める
+        
+        # CN2の信頼度判定
+        if self.P2 > 0 and (self.P2 / self.P1) >= alpha_threshold:
+            if self.CN2 not in candidates:  # 重複回避
+                candidates.append(self.CN2)
+        
+        # CN3の信頼度判定
+        if self.P3 > 0 and (self.P3 / self.P1) >= beta_threshold:
+            if self.CN3 not in candidates:  # 重複回避
+                candidates.append(self.CN3)
+        
+        return candidates
 
 
 # ================================================================================
@@ -466,6 +504,86 @@ class CluMPSimulator:
 
 
 # ================================================================================
+# 改良版CluMPシミュレータ（複数候補予測）
+# ================================================================================
+
+class ImprovedCluMPSimulator(CluMPSimulator):
+    """
+    改良版CluMP: 信頼度比率ベースの複数候補プリフェッチ
+    
+    【改良点】
+    従来のCluMPはCN1のみを予測に使用するが、本版ではMCRowが保持する
+    CN2, CN3も信頼度に応じて活用することで、予測のカバレッジを向上させる。
+    
+    【アルゴリズム】
+    1. CN1は常にプリフェッチ対象（最頻出）
+    2. P2/P1 >= α なら CN2もプリフェッチ
+    3. P3/P1 >= β なら CN3もプリフェッチ
+    
+    これにより、アクセスパターンが複数の遷移先を持つ場合に
+    より多くのケースをカバーできる。
+    """
+    
+    def __init__(self, config):
+        super().__init__(config)
+        self.alpha = config.ALPHA_THRESHOLD
+        self.beta = config.BETA_THRESHOLD
+    
+    def process_access(self, block_id):
+        """
+        改良版の8ステップアルゴリズム
+        
+        従来版との違いは Step 7 のみ:
+          従来: CN1のみ予測
+          改良: CN1, CN2, CN3を信頼度で選択
+        """
+        self.stats['total_accesses'] += 1
+        current_chunk = self._block_to_chunk(block_id)
+        
+        # プリフェッチ精度評価
+        if block_id in self.prefetched_blocks:
+            self.stats['prefetch_blocks_used'] += 1
+            self.prefetched_blocks.discard(block_id)
+            if block_id in self.prefetch_metadata:
+                del self.prefetch_metadata[block_id]
+        
+        # Step 1-2: キャッシュ確認
+        is_hit = self._access_cache(block_id)
+        
+        if is_hit:
+            self.stats['cache_hits'] += 1
+        else:
+            self.stats['cache_misses'] += 1
+        
+        # Step 5-6: MCRowの確認と更新
+        if self.last_chunk is not None:
+            mcrow = self._get_or_create_mcrow(self.last_chunk)
+            mcrow.update(current_chunk)
+            
+            # Step 7: 改良版予測（複数候補）
+            predicted_chunks = mcrow.predict_multi(self.alpha, self.beta)
+            
+            # 各候補についてプリフェッチ実行
+            for predicted_chunk in predicted_chunks:
+                prefetched_blocks = self._prefetch(predicted_chunk)
+                if len(prefetched_blocks) > 0:
+                    self.stats['prefetch_issued'] += 1
+                    self.stats['prefetch_blocks_total'] += len(prefetched_blocks)
+        
+        # 今回のチャンクを記録
+        self.last_chunk = current_chunk
+        
+        # 履歴記録（100アクセスごと）
+        if self.stats['total_accesses'] % 100 == 0:
+            hit_rate = self.stats['cache_hits'] / self.stats['total_accesses']
+            self.stats['hit_rate_history'].append(hit_rate)
+            
+            if self.stats['prefetch_blocks_total'] > 0:
+                accuracy = self.stats['prefetch_blocks_used'] / self.stats['prefetch_blocks_total']
+                self.stats['prefetch_accuracy_history'].append(accuracy)
+
+
+# ================================================================================
 # ワークロード生成器
 # ================================================================================
 
@@ -706,8 +824,8 @@ class BaselineSimulator:
 # 結果の可視化と保存
 # ================================================================================
 
-def save_results(config, clump_results, baseline_results, workload_info, output_dir):
-    """結果をファイルとグラフで保存"""
+def save_results(config, clump_results, improved_results, baseline_results, workload_info, output_dir):
+    """結果をファイルとグラフで保存（3者比較版）"""
     
     # 出力ディレクトリ作成
     output_path = Path(output_dir)
@@ -729,14 +847,21 @@ def save_results(config, clump_results, baseline_results, workload_info, output_
             'workload_type': config.WORKLOAD_TYPE,
             'workload_size': config.WORKLOAD_SIZE,
             'locality_factor': config.LOCALITY_FACTOR,
-            'sequential_ratio': config.SEQUENTIAL_RATIO
+            'sequential_ratio': config.SEQUENTIAL_RATIO,
+            'alpha_threshold': config.ALPHA_THRESHOLD,
+            'beta_threshold': config.BETA_THRESHOLD
         },
         'clump_results': clump_results,
+        'improved_clump_results': improved_results,
         'baseline_results': baseline_results,
         'workload_info': workload_info,
         'improvement': {
-            'hit_rate_improvement': clump_results['cache_hit_rate'] / baseline_results['cache_hit_rate']
-            if baseline_results['cache_hit_rate'] > 0 else 0
+            'clump_vs_baseline': clump_results['cache_hit_rate'] / baseline_results['cache_hit_rate']
+            if baseline_results['cache_hit_rate'] > 0 else 0,
+            'improved_vs_baseline': improved_results['cache_hit_rate'] / baseline_results['cache_hit_rate']
+            if baseline_results['cache_hit_rate'] > 0 else 0,
+            'improved_vs_clump': improved_results['cache_hit_rate'] / clump_results['cache_hit_rate']
+            if clump_results['cache_hit_rate'] > 0 else 0
         }
     }
     
@@ -758,7 +883,7 @@ def save_results(config, clump_results, baseline_results, workload_info, output_
         f.write(f"プリフェッチウィンドウ: {config.PREFETCH_WINDOW_SIZE} ブロック\n")
         f.write(f"ワークロード: {config.WORKLOAD_TYPE}, {config.WORKLOAD_SIZE:,} アクセス\n\n")
         
-        f.write("[CluMP 結果]\n")
+        f.write("[CluMP (論文版) 結果]\n")
         f.write(f"キャッシュヒット率: {clump_results['cache_hit_rate']:.2%}\n")
         f.write(f"プリフェッチ精度: {clump_results['prefetch_accuracy']:.2%}\n")
         f.write(f"  - 使用されたブロック: {clump_results['prefetch_blocks_used']:,}\n")
@@ -767,6 +892,16 @@ def save_results(config, clump_results, baseline_results, workload_info, output_
         f.write(f"プリフェッチ実行回数: {clump_results['prefetch_issued']:,}\n")
         f.write(f"MCRow数: {clump_results['mcrow_count']:,}\n")
         f.write(f"メモリ使用量: {clump_results['memory_usage_kb']:.2f} KB\n\n")
+        
+        f.write("[Improved CluMP (改良版) 結果]\n")
+        f.write(f"キャッシュヒット率: {improved_results['cache_hit_rate']:.2%}\n")
+        f.write(f"プリフェッチ精度: {improved_results['prefetch_accuracy']:.2%}\n")
+        f.write(f"  - 使用されたブロック: {improved_results['prefetch_blocks_used']:,}\n")
+        f.write(f"  - 無駄だったブロック: {improved_results['prefetch_blocks_wasted']:,}\n")
+        f.write(f"  - 総プリフェッチブロック: {improved_results['prefetch_blocks_total']:,}\n")
+        f.write(f"プリフェッチ実行回数: {improved_results['prefetch_issued']:,}\n")
+        f.write(f"MCRow数: {improved_results['mcrow_count']:,}\n")
+        f.write(f"メモリ使用量: {improved_results['memory_usage_kb']:.2f} KB\n\n")
         
         f.write("[Baseline (Linux ReadAhead) 結果]\n")
         f.write(f"キャッシュヒット率: {baseline_results['cache_hit_rate']:.2%}\n")
@@ -777,44 +912,64 @@ def save_results(config, clump_results, baseline_results, workload_info, output_
         f.write(f"プリフェッチ実行回数: {baseline_results['prefetch_issued']:,}\n\n")
         
         f.write("[改善率]\n")
-        improvement = clump_results['cache_hit_rate'] / baseline_results['cache_hit_rate'] if baseline_results['cache_hit_rate'] > 0 else 0
-        f.write(f"ヒット率改善: {improvement:.2f}x ({improvement * 100 - 100:+.1f}%)\n")
+        imp_c_vs_b = clump_results['cache_hit_rate'] / baseline_results['cache_hit_rate'] if baseline_results['cache_hit_rate'] > 0 else 0
+        imp_i_vs_b = improved_results['cache_hit_rate'] / baseline_results['cache_hit_rate'] if baseline_results['cache_hit_rate'] > 0 else 0
+        imp_i_vs_c = improved_results['cache_hit_rate'] / clump_results['cache_hit_rate'] if clump_results['cache_hit_rate'] > 0 else 0
+        f.write(f"CluMP vs Baseline: {imp_c_vs_b:.2f}x ({imp_c_vs_b * 100 - 100:+.1f}%)\n")
+        f.write(f"Improved vs Baseline: {imp_i_vs_b:.2f}x ({imp_i_vs_b * 100 - 100:+.1f}%)\n")
+        f.write(f"Improved vs CluMP: {imp_i_vs_c:.2f}x ({imp_i_vs_c * 100 - 100:+.1f}%)\n")
     
     # === 2. グラフ生成 ===
     if config.SAVE_GRAPHS:
-        # ヒット率比較
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.bar(['Linux ReadAhead', 'CluMP'], 
-               [baseline_results['cache_hit_rate'], clump_results['cache_hit_rate']],
-               color=['#ff7f0e', '#1f77b4'])
+        # ヒット率比較（3者）
+        fig, ax = plt.subplots(figsize=(12, 6))
+        methods = ['Linux ReadAhead', 'CluMP (Original)', 'Improved CluMP']
+        values = [baseline_results['cache_hit_rate'], 
+                 clump_results['cache_hit_rate'], 
+                 improved_results['cache_hit_rate']]
+        colors = ['#ff7f0e', '#1f77b4', '#2ca02c']
+        
+        ax.bar(methods, values, color=colors)
         ax.set_ylabel('Cache Hit Rate')
-        ax.set_title('CluMP vs Linux ReadAhead - Cache Hit Rate Comparison')
+        ax.set_title('Cache Hit Rate Comparison: Baseline vs CluMP vs Improved CluMP')
         ax.set_ylim(0, 1.0)
-        for i, v in enumerate([baseline_results['cache_hit_rate'], clump_results['cache_hit_rate']]):
+        for i, v in enumerate(values):
             ax.text(i, v + 0.02, f'{v:.2%}', ha='center', fontweight='bold')
         plt.tight_layout()
         plt.savefig(session_dir / 'hit_rate_comparison.png', dpi=150)
         plt.close()
         
-        # プリフェッチ精度比較
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.bar(['Linux ReadAhead', 'CluMP'], 
-               [baseline_results['prefetch_accuracy'], clump_results['prefetch_accuracy']],
-               color=['#ff7f0e', '#1f77b4'])
+        # プリフェッチ精度比較（3者）
+        fig, ax = plt.subplots(figsize=(12, 6))
+        methods = ['Linux ReadAhead', 'CluMP (Original)', 'Improved CluMP']
+        values = [baseline_results['prefetch_accuracy'], 
+                 clump_results['prefetch_accuracy'], 
+                 improved_results['prefetch_accuracy']]
+        colors = ['#ff7f0e', '#1f77b4', '#2ca02c']
+        
+        ax.bar(methods, values, color=colors)
         ax.set_ylabel('Prefetch Accuracy')
-        ax.set_title('CluMP vs Linux ReadAhead - Prefetch Accuracy Comparison')
+        ax.set_title('Prefetch Accuracy Comparison: Baseline vs CluMP vs Improved CluMP')
         ax.set_ylim(0, 1.0)
-        for i, v in enumerate([baseline_results['prefetch_accuracy'], clump_results['prefetch_accuracy']]):
+        for i, v in enumerate(values):
             ax.text(i, v + 0.02, f'{v:.2%}', ha='center', fontweight='bold')
         plt.tight_layout()
         plt.savefig(session_dir / 'prefetch_accuracy_comparison.png', dpi=150)
         plt.close()
         
-        # ヒット率推移
+        # ヒット率推移（3者）
         fig, ax = plt.subplots(figsize=(12, 6))
-        x = list(range(len(clump_results['hit_rate_history'])))
-        ax.plot(x, clump_results['hit_rate_history'], label='CluMP', linewidth=2)
-        ax.plot(x, baseline_results['hit_rate_history'], label='Linux ReadAhead', linewidth=2)
+        x_clump = list(range(len(clump_results['hit_rate_history'])))
+        x_improved = list(range(len(improved_results['hit_rate_history'])))
+        x_baseline = list(range(len(baseline_results['hit_rate_history'])))
+        
+        ax.plot(x_baseline, baseline_results['hit_rate_history'], 
+               label='Linux ReadAhead', linewidth=2, color='#ff7f0e')
+        ax.plot(x_clump, clump_results['hit_rate_history'], 
+               label='CluMP (Original)', linewidth=2, color='#1f77b4')
+        ax.plot(x_improved, improved_results['hit_rate_history'], 
+               label='Improved CluMP', linewidth=2, color='#2ca02c')
+        
         ax.set_xlabel('Time (×100 accesses)')
         ax.set_ylabel('Cache Hit Rate')
         ax.set_title('Hit Rate Progression Over Time')
@@ -824,19 +979,26 @@ def save_results(config, clump_results, baseline_results, workload_info, output_
         plt.savefig(session_dir / 'hit_rate_progression.png', dpi=150)
         plt.close()
         
-        # プリフェッチ精度推移（両者の比較）
-        if len(clump_results['prefetch_accuracy_history']) > 0 or len(baseline_results['prefetch_accuracy_history']) > 0:
+        # プリフェッチ精度推移（3者）
+        if (len(clump_results['prefetch_accuracy_history']) > 0 or 
+            len(improved_results['prefetch_accuracy_history']) > 0 or 
+            len(baseline_results['prefetch_accuracy_history']) > 0):
             fig, ax = plt.subplots(figsize=(12, 6))
-            
-            if len(clump_results['prefetch_accuracy_history']) > 0:
-                x_clump = list(range(len(clump_results['prefetch_accuracy_history'])))
-                ax.plot(x_clump, clump_results['prefetch_accuracy_history'], 
-                       label='CluMP', linewidth=2, color='#1f77b4')
             
             if len(baseline_results['prefetch_accuracy_history']) > 0:
                 x_baseline = list(range(len(baseline_results['prefetch_accuracy_history'])))
                 ax.plot(x_baseline, baseline_results['prefetch_accuracy_history'], 
                        label='Linux ReadAhead', linewidth=2, color='#ff7f0e')
+            
+            if len(clump_results['prefetch_accuracy_history']) > 0:
+                x_clump = list(range(len(clump_results['prefetch_accuracy_history'])))
+                ax.plot(x_clump, clump_results['prefetch_accuracy_history'], 
+                       label='CluMP (Original)', linewidth=2, color='#1f77b4')
+            
+            if len(improved_results['prefetch_accuracy_history']) > 0:
+                x_improved = list(range(len(improved_results['prefetch_accuracy_history'])))
+                ax.plot(x_improved, improved_results['prefetch_accuracy_history'], 
+                       label='Improved CluMP', linewidth=2, color='#2ca02c')
             
             ax.set_xlabel('Time (×100 accesses)')
             ax.set_ylabel('Prefetch Accuracy')
@@ -898,8 +1060,8 @@ def main():
     print(f"  - ユニークブロック数: {workload_info['unique_blocks']:,}")
     print(f"  - ユニークチャンク数: {workload_info['unique_chunks']:,}")
     
-    # CluMPシミュレーション
-    print("\n[CluMP シミュレーション実行中...]")
+    # CluMP（論文版）シミュレーション
+    print("\n[CluMP (Original) シミュレーション実行中...]")
     clump = CluMPSimulator(config)
     for i, block_id in enumerate(workload):
         clump.process_access(block_id)
@@ -908,6 +1070,18 @@ def main():
     
     clump_results = clump.get_results()
     print(f"✓ 完了 - ヒット率: {clump_results['cache_hit_rate']:.2%}")
+    
+    # Improved CluMP（改良版）シミュレーション
+    print(f"\n[Improved CluMP シミュレーション実行中...]")
+    print(f"  パラメータ: α={config.ALPHA_THRESHOLD}, β={config.BETA_THRESHOLD}")
+    improved = ImprovedCluMPSimulator(config)
+    for i, block_id in enumerate(workload):
+        improved.process_access(block_id)
+        if config.VERBOSE_LOG and (i + 1) % 1000 == 0:
+            print(f"  進捗: {i + 1:,} / {len(workload):,} ({(i + 1) / len(workload) * 100:.1f}%)")
+    
+    improved_results = improved.get_results()
+    print(f"✓ 完了 - ヒット率: {improved_results['cache_hit_rate']:.2%}")
     
     # ベースラインシミュレーション
     print("\n[Baseline (Linux ReadAhead) シミュレーション実行中...]")
@@ -918,38 +1092,51 @@ def main():
     baseline_results = baseline.get_results()
     print(f"✓ 完了 - ヒット率: {baseline_results['cache_hit_rate']:.2%}")
     
-    # 結果比較
+    # 結果比較（3者）
     print("\n[結果比較]")
-    hit_improvement = clump_results['cache_hit_rate'] / baseline_results['cache_hit_rate'] if baseline_results['cache_hit_rate'] > 0 else 0
-    print(f"\n=== キャッシュヒット率 ===")
-    print(f"CluMP: {clump_results['cache_hit_rate']:.2%}")
-    print(f"Baseline: {baseline_results['cache_hit_rate']:.2%}")
-    print(f"改善率: {hit_improvement:.2f}x ({hit_improvement * 100 - 100:+.1f}%)")
+    print("\n" + "=" * 80)
+    print("=== キャッシュヒット率 ===")
+    print("=" * 80)
+    print(f"Baseline (Linux RA):   {baseline_results['cache_hit_rate']:.2%}")
+    print(f"CluMP (Original):      {clump_results['cache_hit_rate']:.2%}")
+    print(f"Improved CluMP:        {improved_results['cache_hit_rate']:.2%}")
     
-    print(f"\n=== プリフェッチ精度 ===")
-    print(f"CluMP: {clump_results['prefetch_accuracy']:.2%}")
-    print(f"Baseline: {baseline_results['prefetch_accuracy']:.2%}")
-    if baseline_results['prefetch_accuracy'] > 0:
-        accuracy_improvement = clump_results['prefetch_accuracy'] / baseline_results['prefetch_accuracy']
-        print(f"改善率: {accuracy_improvement:.2f}x ({accuracy_improvement * 100 - 100:+.1f}%)")
+    imp_c_vs_b = clump_results['cache_hit_rate'] / baseline_results['cache_hit_rate'] if baseline_results['cache_hit_rate'] > 0 else 0
+    imp_i_vs_b = improved_results['cache_hit_rate'] / baseline_results['cache_hit_rate'] if baseline_results['cache_hit_rate'] > 0 else 0
+    imp_i_vs_c = improved_results['cache_hit_rate'] / clump_results['cache_hit_rate'] if clump_results['cache_hit_rate'] > 0 else 0
     
-    print(f"\n=== CluMP 詳細 ===")
-    print(f"プリフェッチ使用ブロック: {clump_results['prefetch_blocks_used']:,}")
-    print(f"プリフェッチ無駄ブロック: {clump_results['prefetch_blocks_wasted']:,}")
-    print(f"総プリフェッチブロック: {clump_results['prefetch_blocks_total']:,}")
-    print(f"プリフェッチ実行回数: {clump_results['prefetch_issued']:,}")
-    print(f"MCRow数: {clump_results['mcrow_count']:,}")
-    print(f"メモリ使用量: {clump_results['memory_usage_kb']:.2f} KB")
+    print(f"\n改善率:")
+    print(f"  CluMP vs Baseline:   {imp_c_vs_b:.3f}x ({imp_c_vs_b * 100 - 100:+.1f}%)")
+    print(f"  Improved vs Baseline: {imp_i_vs_b:.3f}x ({imp_i_vs_b * 100 - 100:+.1f}%)")
+    print(f"  Improved vs CluMP:    {imp_i_vs_c:.3f}x ({imp_i_vs_c * 100 - 100:+.1f}%)")
     
-    print(f"\n=== Baseline 詳細 ===")
-    print(f"プリフェッチ使用ブロック: {baseline_results['prefetch_blocks_used']:,}")
-    print(f"プリフェッチ無駄ブロック: {baseline_results['prefetch_blocks_wasted']:,}")
-    print(f"総プリフェッチブロック: {baseline_results['prefetch_blocks_total']:,}")
-    print(f"プリフェッチ実行回数: {baseline_results['prefetch_issued']:,}")
+    print("\n" + "=" * 80)
+    print("=== プリフェッチ精度 ===")
+    print("=" * 80)
+    print(f"Baseline (Linux RA):   {baseline_results['prefetch_accuracy']:.2%}")
+    print(f"CluMP (Original):      {clump_results['prefetch_accuracy']:.2%}")
+    print(f"Improved CluMP:        {improved_results['prefetch_accuracy']:.2%}")
+    
+    print("\n" + "=" * 80)
+    print("=== 詳細統計 ===")
+    print("=" * 80)
+    print(f"\n【CluMP (Original)】")
+    print(f"  プリフェッチ使用/無駄/総: {clump_results['prefetch_blocks_used']:,} / {clump_results['prefetch_blocks_wasted']:,} / {clump_results['prefetch_blocks_total']:,}")
+    print(f"  プリフェッチ実行回数: {clump_results['prefetch_issued']:,}")
+    print(f"  MCRow数: {clump_results['mcrow_count']:,}, メモリ: {clump_results['memory_usage_kb']:.2f} KB")
+    
+    print(f"\n【Improved CluMP】")
+    print(f"  プリフェッチ使用/無駄/総: {improved_results['prefetch_blocks_used']:,} / {improved_results['prefetch_blocks_wasted']:,} / {improved_results['prefetch_blocks_total']:,}")
+    print(f"  プリフェッチ実行回数: {improved_results['prefetch_issued']:,}")
+    print(f"  MCRow数: {improved_results['mcrow_count']:,}, メモリ: {improved_results['memory_usage_kb']:.2f} KB")
+    
+    print(f"\n【Baseline (Linux RA)】")
+    print(f"  プリフェッチ使用/無駄/総: {baseline_results['prefetch_blocks_used']:,} / {baseline_results['prefetch_blocks_wasted']:,} / {baseline_results['prefetch_blocks_total']:,}")
+    print(f"  プリフェッチ実行回数: {baseline_results['prefetch_issued']:,}")
     
     # 結果保存
     print("\n[結果保存中...]")
-    output_dir = save_results(config, clump_results, baseline_results, workload_info, config.OUTPUT_DIR)
+    output_dir = save_results(config, clump_results, improved_results, baseline_results, workload_info, config.OUTPUT_DIR)
     
     print("\n" + "=" * 80)
     print("シミュレーション完了")
