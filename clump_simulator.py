@@ -56,6 +56,9 @@ from datetime import datetime
 from pathlib import Path
 import matplotlib.pyplot as plt
 import matplotlib
+from multiprocessing import Pool, cpu_count
+import numpy as np
+from scipy import stats as scipy_stats
 matplotlib.use('Agg')  # GUIなし環境対応
 
 # ================================================================================
@@ -71,7 +74,7 @@ class SimulatorConfig:
     """
     
     # === 基本パラメータ（論文Section 3.2, 4.1） ===
-    TOTAL_BLOCKS = 10888           # 総ブロック数（例: 200MB相当、4KB/ブロック）
+    TOTAL_BLOCKS = 10888            # 総ブロック数（例: 200MB相当、4KB/ブロック）
                                     # 論文: KVM=10,888, カーネルビルド=2,086,048
     
     CHUNK_SIZE = 16                 # チャンクサイズ（ブロック数/チャンク）
@@ -99,14 +102,24 @@ class SimulatorConfig:
     WORKLOAD_SIZE = 10888          # I/Oアクセス回数
     
     # === 高度なワークロード設定（mixedモード用） ===
-    LOCALITY_FACTOR = 0.8          # 局所性 (0.0-1.0): 高いほどアクセスが集中
-    SEQUENTIAL_RATIO = 0.4         # 連続アクセス割合 (0.0-1.0)
-    PHASE_COUNT = 5                # アクセスパターンの変化回数
-    HOT_SPOT_RATIO = 0.3           # ホットスポット集中度 (0.0-1.0)
+    LOCALITY_FACTOR = 0.7          # 局所性 (0.0-1.0): 高いほどアクセスが集中
+                                    # 0.7 = 70%の範囲に集中（実アプリの典型値）
+    SEQUENTIAL_RATIO = 0.3         # 連続アクセス割合 (0.0-1.0)
+                                    # 0.3 = 30%が連続（論文結果から逆算）
+    PHASE_COUNT = 8                # アクセスパターンの変化回数
+                                    # ビルドプロセスの段階を模擬（8段階）
+    HOT_SPOT_RATIO = 0.2           # ホットスポット集中度 (0.0-1.0)
+                                    # 0.2 = 20%がホットデータ（パレートの法則）
     
     # === 改良版CluMPパラメータ ===
     ALPHA_THRESHOLD = 0.5          # CN2を含める閾値（P2/P1 >= α）
     BETA_THRESHOLD = 0.3           # CN3を含める閾値（P3/P1 >= β）
+    
+    # === マルチ試行設定 ===
+    NUM_TRIALS = 100                 # 試行回数（1=シングル実行、10+=統計分析用）
+    RANDOM_SEED_BASE = 42          # ランダムシードの基準値（再現性確保）
+    USE_PARALLEL = True           # CPU並列処理を使用（NUM_TRIALS > 1時のみ有効）
+    MAX_WORKERS = None             # 並列ワーカー数（Noneで自動：CPU数）
     
     # === 出力設定 ===
     OUTPUT_DIR = "output"          # 出力ディレクトリ名
@@ -605,8 +618,11 @@ class WorkloadGenerator:
       - Mixed: 局所性+逐次性+フェーズ変化+ホットスポット
     """
     
-    def __init__(self, config):
+    def __init__(self, config, seed=None):
         self.config = config
+        self.seed = seed
+        if seed is not None:
+            random.seed(seed)
     
     def generate(self):
         """設定に基づいてワークロード生成"""
@@ -818,6 +834,400 @@ class BaselineSimulator:
             'hit_rate_history': self.stats['hit_rate_history'],
             'prefetch_accuracy_history': self.stats['prefetch_accuracy_history']
         }
+
+
+# ================================================================================
+# マルチ試行実行と統計分析
+# ================================================================================
+
+def run_single_trial(args):
+    """
+    単一試行を実行（並列処理用）
+    
+    引数:
+        args: (config, trial_number) のタプル
+    
+    戻り値:
+        (trial_number, clump_results, improved_results, baseline_results, workload_info)
+    """
+    config, trial_num = args
+    seed = config.RANDOM_SEED_BASE + trial_num
+    
+    # ワークロード生成（シード固定で再現性確保）
+    generator = WorkloadGenerator(config, seed=seed)
+    workload = generator.generate()
+    
+    workload_info = {
+        'unique_blocks': len(set(workload)),
+        'unique_chunks': len(set(b // config.CHUNK_SIZE for b in workload)),
+        'seed': seed
+    }
+    
+    # CluMP（論文版）シミュレーション
+    clump = CluMPSimulator(config)
+    for block_id in workload:
+        clump.process_access(block_id)
+    clump_results = clump.get_results()
+    
+    # Improved CluMP（改良版）シミュレーション
+    improved = ImprovedCluMPSimulator(config)
+    for block_id in workload:
+        improved.process_access(block_id)
+    improved_results = improved.get_results()
+    
+    # ベースラインシミュレーション
+    baseline = BaselineSimulator(config)
+    for block_id in workload:
+        baseline.process_access(block_id)
+    baseline_results = baseline.get_results()
+    
+    return (trial_num, clump_results, improved_results, baseline_results, workload_info)
+
+
+def run_multiple_trials(config):
+    """
+    複数試行を実行（CPU並列化対応、進捗表示付き）
+    
+    引数:
+        config: SimulatorConfig インスタンス
+    
+    戻り値:
+        all_results: 各試行の結果リスト
+    """
+    num_trials = config.NUM_TRIALS
+    
+    print(f"\n[マルチ試行実行: {num_trials}回]")
+    
+    if config.USE_PARALLEL and num_trials > 1:
+        # 並列実行（進捗表示付き）
+        max_workers = config.MAX_WORKERS if config.MAX_WORKERS else min(num_trials, cpu_count())
+        print(f"CPU並列処理を使用: {max_workers}ワーカー（CPUコア数: {cpu_count()}）")
+        print(f"並列実行中... (最大{max_workers}試行が同時に実行されます)")
+        
+        args_list = [(config, i) for i in range(num_trials)]
+        results = []
+        
+        import time
+        start_time = time.time()
+        
+        with Pool(processes=max_workers) as pool:
+            # imap()で完了した試行から順次受け取る
+            for idx, result in enumerate(pool.imap(run_single_trial, args_list), 1):
+                results.append(result)
+                elapsed = time.time() - start_time
+                avg_time = elapsed / idx
+                remaining = (num_trials - idx) * avg_time
+                
+                print(f"  ✓ 試行 {idx}/{num_trials} 完了 "
+                      f"(経過: {elapsed:.1f}秒, 推定残り: {remaining:.1f}秒)")
+        
+        total_time = time.time() - start_time
+        print(f"✓ 全{num_trials}試行完了（並列実行、合計: {total_time:.1f}秒）")
+    else:
+        # 逐次実行
+        if num_trials > 1:
+            print("逐次実行モード（並列処理無効）")
+        
+        import time
+        start_time = time.time()
+        results = []
+        
+        for i in range(num_trials):
+            trial_start = time.time()
+            print(f"  試行 {i+1}/{num_trials} 実行中...")
+            result = run_single_trial((config, i))
+            results.append(result)
+            
+            trial_time = time.time() - trial_start
+            elapsed = time.time() - start_time
+            avg_time = elapsed / (i + 1)
+            remaining = (num_trials - i - 1) * avg_time
+            
+            print(f"  ✓ 試行 {i+1} 完了 ({trial_time:.1f}秒, 推定残り: {remaining:.1f}秒)")
+    
+    return results
+
+
+def calculate_statistics(all_results):
+    """
+    複数試行の結果から統計量を計算
+    
+    引数:
+        all_results: run_multiple_trials()の戻り値
+    
+    戻り値:
+        statistics: 統計情報を含む辞書
+    """
+    num_trials = len(all_results)
+    
+    # 各手法の結果を集約
+    clump_hit_rates = []
+    clump_prefetch_acc = []
+    improved_hit_rates = []
+    improved_prefetch_acc = []
+    baseline_hit_rates = []
+    baseline_prefetch_acc = []
+    
+    for trial_num, clump_res, improved_res, baseline_res, wl_info in all_results:
+        clump_hit_rates.append(clump_res['cache_hit_rate'])
+        clump_prefetch_acc.append(clump_res['prefetch_accuracy'])
+        improved_hit_rates.append(improved_res['cache_hit_rate'])
+        improved_prefetch_acc.append(improved_res['prefetch_accuracy'])
+        baseline_hit_rates.append(baseline_res['cache_hit_rate'])
+        baseline_prefetch_acc.append(baseline_res['prefetch_accuracy'])
+    
+    def compute_stats(values):
+        """平均、標準偏差、95%信頼区間を計算"""
+        arr = np.array(values)
+        mean = np.mean(arr)
+        std = np.std(arr, ddof=1) if len(arr) > 1 else 0.0
+        
+        if len(arr) > 1:
+            # 95%信頼区間（t分布）
+            confidence = 0.95
+            dof = len(arr) - 1
+            t_value = scipy_stats.t.ppf((1 + confidence) / 2, dof)
+            margin = t_value * (std / np.sqrt(len(arr)))
+            ci_lower = mean - margin
+            ci_upper = mean + margin
+        else:
+            ci_lower = mean
+            ci_upper = mean
+        
+        return {
+            'mean': float(mean),
+            'std': float(std),
+            'min': float(np.min(arr)),
+            'max': float(np.max(arr)),
+            'ci_lower': float(ci_lower),
+            'ci_upper': float(ci_upper)
+        }
+    
+    statistics = {
+        'num_trials': num_trials,
+        'clump': {
+            'hit_rate': compute_stats(clump_hit_rates),
+            'prefetch_accuracy': compute_stats(clump_prefetch_acc)
+        },
+        'improved': {
+            'hit_rate': compute_stats(improved_hit_rates),
+            'prefetch_accuracy': compute_stats(improved_prefetch_acc)
+        },
+        'baseline': {
+            'hit_rate': compute_stats(baseline_hit_rates),
+            'prefetch_accuracy': compute_stats(baseline_prefetch_acc)
+        },
+        'raw_data': {
+            'clump_hit_rates': clump_hit_rates,
+            'clump_prefetch_acc': clump_prefetch_acc,
+            'improved_hit_rates': improved_hit_rates,
+            'improved_prefetch_acc': improved_prefetch_acc,
+            'baseline_hit_rates': baseline_hit_rates,
+            'baseline_prefetch_acc': baseline_prefetch_acc
+        }
+    }
+    
+    return statistics
+
+
+def save_results_with_statistics(config, statistics, all_results, output_dir):
+    """
+    統計分析結果を含めて保存
+    
+    引数:
+        config: SimulatorConfig
+        statistics: calculate_statistics()の戻り値
+        all_results: run_multiple_trials()の戻り値
+        output_dir: 出力ディレクトリ
+    """
+    # 出力ディレクトリ作成
+    output_path = Path(output_dir)
+    output_path.mkdir(exist_ok=True)
+    
+    # タイムスタンプ付きサブディレクトリ
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    session_dir = output_path / f"session_{timestamp}_trials{statistics['num_trials']}"
+    session_dir.mkdir(exist_ok=True)
+    
+    # === 1. JSON保存（統計データ含む） ===
+    report = {
+        'configuration': {
+            'total_blocks': config.TOTAL_BLOCKS,
+            'chunk_size': config.CHUNK_SIZE,
+            'cluster_size': config.CLUSTER_SIZE,
+            'cache_size': config.CACHE_SIZE,
+            'prefetch_window_size': config.PREFETCH_WINDOW_SIZE,
+            'workload_type': config.WORKLOAD_TYPE,
+            'workload_size': config.WORKLOAD_SIZE,
+            'locality_factor': config.LOCALITY_FACTOR,
+            'sequential_ratio': config.SEQUENTIAL_RATIO,
+            'alpha_threshold': config.ALPHA_THRESHOLD,
+            'beta_threshold': config.BETA_THRESHOLD,
+            'num_trials': config.NUM_TRIALS,
+            'random_seed_base': config.RANDOM_SEED_BASE,
+            'use_parallel': config.USE_PARALLEL
+        },
+        'statistics': statistics,
+        'all_trials': [
+            {
+                'trial': trial_num,
+                'clump': clump_res,
+                'improved': improved_res,
+                'baseline': baseline_res,
+                'workload_info': wl_info
+            }
+            for trial_num, clump_res, improved_res, baseline_res, wl_info in all_results
+        ]
+    }
+    
+    with open(session_dir / 'results.json', 'w', encoding='utf-8') as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+    
+    # === 2. テキストレポート ===
+    with open(session_dir / 'summary.txt', 'w', encoding='utf-8') as f:
+        f.write("=" * 80 + "\n")
+        f.write("CluMP Simulator - マルチ試行実行結果サマリ\n")
+        f.write("=" * 80 + "\n\n")
+        
+        f.write("[設定]\n")
+        f.write(f"総ブロック数: {config.TOTAL_BLOCKS:,} ({config.TOTAL_BLOCKS * 4 / 1024:.1f} MB)\n")
+        f.write(f"チャンクサイズ: {config.CHUNK_SIZE} ブロック\n")
+        f.write(f"クラスタサイズ: {config.CLUSTER_SIZE} チャンク\n")
+        f.write(f"キャッシュサイズ: {config.CACHE_SIZE:,} ブロック ({config.CACHE_SIZE * 4 / 1024:.1f} MB)\n")
+        f.write(f"プリフェッチウィンドウ: {config.PREFETCH_WINDOW_SIZE} ブロック\n")
+        f.write(f"ワークロード: {config.WORKLOAD_TYPE}, {config.WORKLOAD_SIZE:,} アクセス\n")
+        f.write(f"試行回数: {statistics['num_trials']}\n")
+        f.write(f"並列処理: {'有効' if config.USE_PARALLEL else '無効'}\n\n")
+        
+        f.write("=" * 80 + "\n")
+        f.write("=== キャッシュヒット率（統計）===\n")
+        f.write("=" * 80 + "\n\n")
+        
+        def write_stats(name, stats_dict):
+            s = stats_dict['hit_rate']
+            f.write(f"{name}:\n")
+            f.write(f"  平均値: {s['mean']:.4f} ({s['mean']*100:.2f}%)\n")
+            f.write(f"  標準偏差: {s['std']:.4f} ({s['std']*100:.2f}%)\n")
+            f.write(f"  95%信頼区間: [{s['ci_lower']:.4f}, {s['ci_upper']:.4f}]\n")
+            f.write(f"  最小値: {s['min']:.4f}, 最大値: {s['max']:.4f}\n\n")
+        
+        write_stats("Baseline (Linux ReadAhead)", statistics['baseline'])
+        write_stats("CluMP (Original)", statistics['clump'])
+        write_stats("Improved CluMP", statistics['improved'])
+        
+        f.write("=" * 80 + "\n")
+        f.write("=== プリフェッチ精度（統計）===\n")
+        f.write("=" * 80 + "\n\n")
+        
+        def write_prefetch_stats(name, stats_dict):
+            s = stats_dict['prefetch_accuracy']
+            f.write(f"{name}:\n")
+            f.write(f"  平均値: {s['mean']:.4f} ({s['mean']*100:.2f}%)\n")
+            f.write(f"  標準偏差: {s['std']:.4f} ({s['std']*100:.2f}%)\n")
+            f.write(f"  95%信頼区間: [{s['ci_lower']:.4f}, {s['ci_upper']:.4f}]\n")
+            f.write(f"  最小値: {s['min']:.4f}, 最大値: {s['max']:.4f}\n\n")
+        
+        write_prefetch_stats("Baseline (Linux ReadAhead)", statistics['baseline'])
+        write_prefetch_stats("CluMP (Original)", statistics['clump'])
+        write_prefetch_stats("Improved CluMP", statistics['improved'])
+        
+        f.write("=" * 80 + "\n")
+        f.write("=== 改善率（平均値）===\n")
+        f.write("=" * 80 + "\n")
+        
+        clump_mean = statistics['clump']['hit_rate']['mean']
+        improved_mean = statistics['improved']['hit_rate']['mean']
+        baseline_mean = statistics['baseline']['hit_rate']['mean']
+        
+        if baseline_mean > 0:
+            imp_c_vs_b = clump_mean / baseline_mean
+            imp_i_vs_b = improved_mean / baseline_mean
+            f.write(f"CluMP vs Baseline:   {imp_c_vs_b:.3f}x ({(imp_c_vs_b - 1) * 100:+.1f}%)\n")
+            f.write(f"Improved vs Baseline: {imp_i_vs_b:.3f}x ({(imp_i_vs_b - 1) * 100:+.1f}%)\n")
+        
+        if clump_mean > 0:
+            imp_i_vs_c = improved_mean / clump_mean
+            f.write(f"Improved vs CluMP:    {imp_i_vs_c:.3f}x ({(imp_i_vs_c - 1) * 100:+.1f}%)\n")
+    
+    # === 3. グラフ生成（エラーバー付き） ===
+    if config.SAVE_GRAPHS:
+        # ヒット率比較（エラーバー付き）
+        fig, ax = plt.subplots(figsize=(12, 6))
+        methods = ['Linux ReadAhead', 'CluMP (Original)', 'Improved CluMP']
+        means = [
+            statistics['baseline']['hit_rate']['mean'],
+            statistics['clump']['hit_rate']['mean'],
+            statistics['improved']['hit_rate']['mean']
+        ]
+        stds = [
+            statistics['baseline']['hit_rate']['std'],
+            statistics['clump']['hit_rate']['std'],
+            statistics['improved']['hit_rate']['std']
+        ]
+        colors = ['#ff7f0e', '#1f77b4', '#2ca02c']
+        
+        bars = ax.bar(methods, means, yerr=stds, capsize=10, color=colors, alpha=0.8)
+        ax.set_ylabel('Cache Hit Rate')
+        ax.set_title(f'Cache Hit Rate Comparison (n={statistics["num_trials"]} trials, mean ± std)')
+        ax.set_ylim(0, 1.0)
+        
+        for i, (m, s) in enumerate(zip(means, stds)):
+            ax.text(i, m + s + 0.02, f'{m:.2%}\n±{s:.2%}', ha='center', fontweight='bold', fontsize=9)
+        
+        plt.tight_layout()
+        plt.savefig(session_dir / 'hit_rate_comparison.png', dpi=150)
+        plt.close()
+        
+        # プリフェッチ精度比較（エラーバー付き）
+        fig, ax = plt.subplots(figsize=(12, 6))
+        means = [
+            statistics['baseline']['prefetch_accuracy']['mean'],
+            statistics['clump']['prefetch_accuracy']['mean'],
+            statistics['improved']['prefetch_accuracy']['mean']
+        ]
+        stds = [
+            statistics['baseline']['prefetch_accuracy']['std'],
+            statistics['clump']['prefetch_accuracy']['std'],
+            statistics['improved']['prefetch_accuracy']['std']
+        ]
+        
+        bars = ax.bar(methods, means, yerr=stds, capsize=10, color=colors, alpha=0.8)
+        ax.set_ylabel('Prefetch Accuracy')
+        ax.set_title(f'Prefetch Accuracy Comparison (n={statistics["num_trials"]} trials, mean ± std)')
+        ax.set_ylim(0, 1.0)
+        
+        for i, (m, s) in enumerate(zip(means, stds)):
+            ax.text(i, m + s + 0.02, f'{m:.2%}\n±{s:.2%}', ha='center', fontweight='bold', fontsize=9)
+        
+        plt.tight_layout()
+        plt.savefig(session_dir / 'prefetch_accuracy_comparison.png', dpi=150)
+        plt.close()
+        
+        # 箱ひげ図（ヒット率）
+        if statistics['num_trials'] >= 3:
+            fig, ax = plt.subplots(figsize=(12, 6))
+            data = [
+                statistics['raw_data']['baseline_hit_rates'],
+                statistics['raw_data']['clump_hit_rates'],
+                statistics['raw_data']['improved_hit_rates']
+            ]
+            bp = ax.boxplot(data, labels=methods, patch_artist=True)
+            
+            for patch, color in zip(bp['boxes'], colors):
+                patch.set_facecolor(color)
+                patch.set_alpha(0.6)
+            
+            ax.set_ylabel('Cache Hit Rate')
+            ax.set_title(f'Cache Hit Rate Distribution (n={statistics["num_trials"]} trials)')
+            ax.set_ylim(0, 1.0)
+            ax.grid(True, alpha=0.3, axis='y')
+            
+            plt.tight_layout()
+            plt.savefig(session_dir / 'hit_rate_boxplot.png', dpi=150)
+            plt.close()
+    
+    print(f"\n✓ 結果を保存しました: {session_dir}")
+    return session_dir
 
 
 # ================================================================================
@@ -1033,7 +1443,7 @@ def main():
     """シミュレータのメイン実行フロー"""
     
     print("=" * 80)
-    print("CluMP Simulator - 論文完全準拠版")
+    print("CluMP Simulator - 論文完全準拠版（CPU並列化対応）")
     print("=" * 80)
     
     # 設定読み込み
@@ -1046,97 +1456,159 @@ def main():
     print(f"キャッシュサイズ: {config.CACHE_SIZE:,} ブロック ({config.CACHE_SIZE * 4 / 1024:.1f} MB)")
     print(f"プリフェッチウィンドウ: {config.PREFETCH_WINDOW_SIZE} ブロック")
     print(f"ワークロード: {config.WORKLOAD_TYPE}, {config.WORKLOAD_SIZE:,} アクセス")
+    print(f"試行回数: {config.NUM_TRIALS}")
     
-    # ワークロード生成
-    print("\n[ワークロード生成中...]")
-    generator = WorkloadGenerator(config)
-    workload = generator.generate()
-    
-    workload_info = {
-        'unique_blocks': len(set(workload)),
-        'unique_chunks': len(set(b // config.CHUNK_SIZE for b in workload))
-    }
-    print(f"✓ {len(workload):,} アクセス生成完了")
-    print(f"  - ユニークブロック数: {workload_info['unique_blocks']:,}")
-    print(f"  - ユニークチャンク数: {workload_info['unique_chunks']:,}")
-    
-    # CluMP（論文版）シミュレーション
-    print("\n[CluMP (Original) シミュレーション実行中...]")
-    clump = CluMPSimulator(config)
-    for i, block_id in enumerate(workload):
-        clump.process_access(block_id)
-        if config.VERBOSE_LOG and (i + 1) % 1000 == 0:
-            print(f"  進捗: {i + 1:,} / {len(workload):,} ({(i + 1) / len(workload) * 100:.1f}%)")
-    
-    clump_results = clump.get_results()
-    print(f"✓ 完了 - ヒット率: {clump_results['cache_hit_rate']:.2%}")
-    
-    # Improved CluMP（改良版）シミュレーション
-    print(f"\n[Improved CluMP シミュレーション実行中...]")
-    print(f"  パラメータ: α={config.ALPHA_THRESHOLD}, β={config.BETA_THRESHOLD}")
-    improved = ImprovedCluMPSimulator(config)
-    for i, block_id in enumerate(workload):
-        improved.process_access(block_id)
-        if config.VERBOSE_LOG and (i + 1) % 1000 == 0:
-            print(f"  進捗: {i + 1:,} / {len(workload):,} ({(i + 1) / len(workload) * 100:.1f}%)")
-    
-    improved_results = improved.get_results()
-    print(f"✓ 完了 - ヒット率: {improved_results['cache_hit_rate']:.2%}")
-    
-    # ベースラインシミュレーション
-    print("\n[Baseline (Linux ReadAhead) シミュレーション実行中...]")
-    baseline = BaselineSimulator(config)
-    for i, block_id in enumerate(workload):
-        baseline.process_access(block_id)
-    
-    baseline_results = baseline.get_results()
-    print(f"✓ 完了 - ヒット率: {baseline_results['cache_hit_rate']:.2%}")
-    
-    # 結果比較（3者）
-    print("\n[結果比較]")
-    print("\n" + "=" * 80)
-    print("=== キャッシュヒット率 ===")
-    print("=" * 80)
-    print(f"Baseline (Linux RA):   {baseline_results['cache_hit_rate']:.2%}")
-    print(f"CluMP (Original):      {clump_results['cache_hit_rate']:.2%}")
-    print(f"Improved CluMP:        {improved_results['cache_hit_rate']:.2%}")
-    
-    imp_c_vs_b = clump_results['cache_hit_rate'] / baseline_results['cache_hit_rate'] if baseline_results['cache_hit_rate'] > 0 else 0
-    imp_i_vs_b = improved_results['cache_hit_rate'] / baseline_results['cache_hit_rate'] if baseline_results['cache_hit_rate'] > 0 else 0
-    imp_i_vs_c = improved_results['cache_hit_rate'] / clump_results['cache_hit_rate'] if clump_results['cache_hit_rate'] > 0 else 0
-    
-    print(f"\n改善率:")
-    print(f"  CluMP vs Baseline:   {imp_c_vs_b:.3f}x ({imp_c_vs_b * 100 - 100:+.1f}%)")
-    print(f"  Improved vs Baseline: {imp_i_vs_b:.3f}x ({imp_i_vs_b * 100 - 100:+.1f}%)")
-    print(f"  Improved vs CluMP:    {imp_i_vs_c:.3f}x ({imp_i_vs_c * 100 - 100:+.1f}%)")
-    
-    print("\n" + "=" * 80)
-    print("=== プリフェッチ精度 ===")
-    print("=" * 80)
-    print(f"Baseline (Linux RA):   {baseline_results['prefetch_accuracy']:.2%}")
-    print(f"CluMP (Original):      {clump_results['prefetch_accuracy']:.2%}")
-    print(f"Improved CluMP:        {improved_results['prefetch_accuracy']:.2%}")
-    
-    print("\n" + "=" * 80)
-    print("=== 詳細統計 ===")
-    print("=" * 80)
-    print(f"\n【CluMP (Original)】")
-    print(f"  プリフェッチ使用/無駄/総: {clump_results['prefetch_blocks_used']:,} / {clump_results['prefetch_blocks_wasted']:,} / {clump_results['prefetch_blocks_total']:,}")
-    print(f"  プリフェッチ実行回数: {clump_results['prefetch_issued']:,}")
-    print(f"  MCRow数: {clump_results['mcrow_count']:,}, メモリ: {clump_results['memory_usage_kb']:.2f} KB")
-    
-    print(f"\n【Improved CluMP】")
-    print(f"  プリフェッチ使用/無駄/総: {improved_results['prefetch_blocks_used']:,} / {improved_results['prefetch_blocks_wasted']:,} / {improved_results['prefetch_blocks_total']:,}")
-    print(f"  プリフェッチ実行回数: {improved_results['prefetch_issued']:,}")
-    print(f"  MCRow数: {improved_results['mcrow_count']:,}, メモリ: {improved_results['memory_usage_kb']:.2f} KB")
-    
-    print(f"\n【Baseline (Linux RA)】")
-    print(f"  プリフェッチ使用/無駄/総: {baseline_results['prefetch_blocks_used']:,} / {baseline_results['prefetch_blocks_wasted']:,} / {baseline_results['prefetch_blocks_total']:,}")
-    print(f"  プリフェッチ実行回数: {baseline_results['prefetch_issued']:,}")
-    
-    # 結果保存
-    print("\n[結果保存中...]")
-    output_dir = save_results(config, clump_results, improved_results, baseline_results, workload_info, config.OUTPUT_DIR)
+    # マルチ試行モード判定
+    if config.NUM_TRIALS > 1:
+        # === マルチ試行モード ===
+        print(f"\n{'='*80}")
+        print(f"マルチ試行モード: {config.NUM_TRIALS}回の試行で統計分析")
+        print(f"{'='*80}")
+        
+        import time
+        start_time = time.time()
+        
+        # 複数試行実行
+        all_results = run_multiple_trials(config)
+        
+        elapsed_time = time.time() - start_time
+        print(f"\n実行時間: {elapsed_time:.1f}秒 ({elapsed_time/60:.1f}分)")
+        print(f"1試行あたり: {elapsed_time/config.NUM_TRIALS:.1f}秒")
+        
+        # 統計分析
+        print("\n[統計分析中...]")
+        statistics = calculate_statistics(all_results)
+        
+        # 結果表示
+        print("\n" + "=" * 80)
+        print("=== キャッシュヒット率（統計）===")
+        print("=" * 80)
+        
+        def print_stats(name, stats_dict):
+            s = stats_dict['hit_rate']
+            print(f"\n{name}:")
+            print(f"  平均値: {s['mean']:.4f} ({s['mean']*100:.2f}%)")
+            print(f"  標準偏差: {s['std']:.4f} ({s['std']*100:.2f}%)")
+            print(f"  95%信頼区間: [{s['ci_lower']:.4f}, {s['ci_upper']:.4f}]")
+            print(f"  範囲: [{s['min']:.4f}, {s['max']:.4f}]")
+        
+        print_stats("Baseline (Linux ReadAhead)", statistics['baseline'])
+        print_stats("CluMP (Original)", statistics['clump'])
+        print_stats("Improved CluMP", statistics['improved'])
+        
+        print("\n" + "=" * 80)
+        print("=== プリフェッチ精度（統計）===")
+        print("=" * 80)
+        
+        def print_prefetch_stats(name, stats_dict):
+            s = stats_dict['prefetch_accuracy']
+            print(f"\n{name}:")
+            print(f"  平均値: {s['mean']:.4f} ({s['mean']*100:.2f}%)")
+            print(f"  標準偏差: {s['std']:.4f} ({s['std']*100:.2f}%)")
+            print(f"  95%信頼区間: [{s['ci_lower']:.4f}, {s['ci_upper']:.4f}]")
+        
+        print_prefetch_stats("Baseline (Linux ReadAhead)", statistics['baseline'])
+        print_prefetch_stats("CluMP (Original)", statistics['clump'])
+        print_prefetch_stats("Improved CluMP", statistics['improved'])
+        
+        # 結果保存
+        print("\n[結果保存中...]")
+        output_dir = save_results_with_statistics(config, statistics, all_results, config.OUTPUT_DIR)
+        
+    else:
+        # === シングル試行モード（従来の動作） ===
+        print("\nシングル試行モード")
+        
+        # ワークロード生成
+        print("\n[ワークロード生成中...]")
+        generator = WorkloadGenerator(config, seed=config.RANDOM_SEED_BASE)
+        workload = generator.generate()
+        
+        workload_info = {
+            'unique_blocks': len(set(workload)),
+            'unique_chunks': len(set(b // config.CHUNK_SIZE for b in workload))
+        }
+        print(f"✓ {len(workload):,} アクセス生成完了")
+        print(f"  - ユニークブロック数: {workload_info['unique_blocks']:,}")
+        print(f"  - ユニークチャンク数: {workload_info['unique_chunks']:,}")
+        
+        # CluMP（論文版）シミュレーション
+        print("\n[CluMP (Original) シミュレーション実行中...]")
+        clump = CluMPSimulator(config)
+        for i, block_id in enumerate(workload):
+            clump.process_access(block_id)
+            if config.VERBOSE_LOG and (i + 1) % 1000 == 0:
+                print(f"  進捗: {i + 1:,} / {len(workload):,} ({(i + 1) / len(workload) * 100:.1f}%)")
+        
+        clump_results = clump.get_results()
+        print(f"✓ 完了 - ヒット率: {clump_results['cache_hit_rate']:.2%}")
+        
+        # Improved CluMP（改良版）シミュレーション
+        print(f"\n[Improved CluMP シミュレーション実行中...]")
+        print(f"  パラメータ: α={config.ALPHA_THRESHOLD}, β={config.BETA_THRESHOLD}")
+        improved = ImprovedCluMPSimulator(config)
+        for i, block_id in enumerate(workload):
+            improved.process_access(block_id)
+            if config.VERBOSE_LOG and (i + 1) % 1000 == 0:
+                print(f"  進捗: {i + 1:,} / {len(workload):,} ({(i + 1) / len(workload) * 100:.1f}%)")
+        
+        improved_results = improved.get_results()
+        print(f"✓ 完了 - ヒット率: {improved_results['cache_hit_rate']:.2%}")
+        
+        # ベースラインシミュレーション
+        print("\n[Baseline (Linux ReadAhead) シミュレーション実行中...]")
+        baseline = BaselineSimulator(config)
+        for i, block_id in enumerate(workload):
+            baseline.process_access(block_id)
+        
+        baseline_results = baseline.get_results()
+        print(f"✓ 完了 - ヒット率: {baseline_results['cache_hit_rate']:.2%}")
+        
+        # 結果比較（3者）
+        print("\n[結果比較]")
+        print("\n" + "=" * 80)
+        print("=== キャッシュヒット率 ===")
+        print("=" * 80)
+        print(f"Baseline (Linux RA):   {baseline_results['cache_hit_rate']:.2%}")
+        print(f"CluMP (Original):      {clump_results['cache_hit_rate']:.2%}")
+        print(f"Improved CluMP:        {improved_results['cache_hit_rate']:.2%}")
+        
+        imp_c_vs_b = clump_results['cache_hit_rate'] / baseline_results['cache_hit_rate'] if baseline_results['cache_hit_rate'] > 0 else 0
+        imp_i_vs_b = improved_results['cache_hit_rate'] / baseline_results['cache_hit_rate'] if baseline_results['cache_hit_rate'] > 0 else 0
+        imp_i_vs_c = improved_results['cache_hit_rate'] / clump_results['cache_hit_rate'] if clump_results['cache_hit_rate'] > 0 else 0
+        
+        print(f"\n改善率:")
+        print(f"  CluMP vs Baseline:   {imp_c_vs_b:.3f}x ({imp_c_vs_b * 100 - 100:+.1f}%)")
+        print(f"  Improved vs Baseline: {imp_i_vs_b:.3f}x ({imp_i_vs_b * 100 - 100:+.1f}%)")
+        print(f"  Improved vs CluMP:    {imp_i_vs_c:.3f}x ({imp_i_vs_c * 100 - 100:+.1f}%)")
+        
+        print("\n" + "=" * 80)
+        print("=== プリフェッチ精度 ===")
+        print("=" * 80)
+        print(f"Baseline (Linux RA):   {baseline_results['prefetch_accuracy']:.2%}")
+        print(f"CluMP (Original):      {clump_results['prefetch_accuracy']:.2%}")
+        print(f"Improved CluMP:        {improved_results['prefetch_accuracy']:.2%}")
+        
+        print("\n" + "=" * 80)
+        print("=== 詳細統計 ===")
+        print("=" * 80)
+        print(f"\n【CluMP (Original)】")
+        print(f"  プリフェッチ使用/無駄/総: {clump_results['prefetch_blocks_used']:,} / {clump_results['prefetch_blocks_wasted']:,} / {clump_results['prefetch_blocks_total']:,}")
+        print(f"  プリフェッチ実行回数: {clump_results['prefetch_issued']:,}")
+        print(f"  MCRow数: {clump_results['mcrow_count']:,}, メモリ: {clump_results['memory_usage_kb']:.2f} KB")
+        
+        print(f"\n【Improved CluMP】")
+        print(f"  プリフェッチ使用/無駄/総: {improved_results['prefetch_blocks_used']:,} / {improved_results['prefetch_blocks_wasted']:,} / {improved_results['prefetch_blocks_total']:,}")
+        print(f"  プリフェッチ実行回数: {improved_results['prefetch_issued']:,}")
+        print(f"  MCRow数: {improved_results['mcrow_count']:,}, メモリ: {improved_results['memory_usage_kb']:.2f} KB")
+        
+        print(f"\n【Baseline (Linux RA)】")
+        print(f"  プリフェッチ使用/無駄/総: {baseline_results['prefetch_blocks_used']:,} / {baseline_results['prefetch_blocks_wasted']:,} / {baseline_results['prefetch_blocks_total']:,}")
+        print(f"  プリフェッチ実行回数: {baseline_results['prefetch_issued']:,}")
+        
+        # 結果保存
+        print("\n[結果保存中...]")
+        output_dir = save_results(config, clump_results, improved_results, baseline_results, workload_info, config.OUTPUT_DIR)
     
     print("\n" + "=" * 80)
     print("シミュレーション完了")
