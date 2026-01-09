@@ -104,7 +104,7 @@ class SimulatorConfig:
     # === 高度なワークロード設定（mixedモード用） ===
     LOCALITY_FACTOR = 0.7          # 局所性 (0.0-1.0): 高いほどアクセスが集中
                                     # 0.7 = 70%の範囲に集中（実アプリの典型値）
-    SEQUENTIAL_RATIO = 0.3         # 連続アクセス割合 (0.0-1.0)
+    SEQUENTIAL_RATIO = 0.9         # 連続アクセス割合 (0.0-1.0)
                                     # 0.3 = 30%が連続（論文結果から逆算）
     PHASE_COUNT = 8                # アクセスパターンの変化回数
                                     # ビルドプロセスの段階を模擬（8段階）
@@ -597,6 +597,175 @@ class ImprovedCluMPSimulator(CluMPSimulator):
 
 
 # ================================================================================
+# 適応的CluMPシミュレータ（動的閾値調整版）
+# ================================================================================
+
+class AdaptiveCluMPSimulator(CluMPSimulator):
+    """
+    適応的CluMP: ワークロード連続性に基づく動的閾値調整
+    
+    【改良点】
+    Improved CluMPの固定閾値(α=0.5, β=0.3)に対し、本版では
+    ワークロードの連続性に応じてαとβを動的に調整する。
+    
+    【アルゴリズム】
+    1. 直近100アクセスにおける連続アクセス比率Sを測定
+    2. Sの値に応じて閾値を調整:
+       - S > 0.7 (高連続性):  (α, β) = (0.7, 0.5) - 厳しい閾値
+       - 0.3 ≤ S ≤ 0.7 (中連続性): (α, β) = (0.5, 0.3) - 標準閾値
+       - S < 0.3 (低連続性):  (α, β) = (0.3, 0.2) - 緩い閾値
+    3. 動的閾値を使ってCN1, CN2, CN3から予測候補を選択
+    
+    【設計原理】
+    - 高連続性: 逐次アクセスが多いため、CN1の信頼度が高い
+                → 閾値を厳しくして少数候補に絞る
+    - 低連続性: ランダムアクセスが多いため、複数遷移先が拮抗
+                → 閾値を緩くして多様な候補をカバー
+    
+    論文(thesis.tex)での定義:
+    "ワークロードの連続性に応じて閾値を動的調整する手法を実装する．
+    直近100アクセスにおける連続アクセス比率Sを測定し，以下の規則で閾値を調整する"
+    """
+    
+    def __init__(self, config):
+        super().__init__(config)
+        
+        # 連続性追跡用（直近100アクセス）
+        self.access_history = []  # 直近のアクセスブロック番号を記録
+        self.window_size = 100     # 連続性測定ウィンドウ
+        
+        # 現在の閾値（初期値は標準値）
+        self.alpha = 0.5
+        self.beta = 0.3
+        
+        # 統計情報（閾値調整の追跡用）
+        self.stats['sequentiality_history'] = []  # 連続性の推移
+        self.stats['alpha_history'] = []          # α閾値の推移
+        self.stats['beta_history'] = []           # β閾値の推移
+    
+    def _calculate_sequentiality(self):
+        """
+        直近100アクセスの連続性比率Sを計算
+        
+        【定義】
+        S = (連続アクセス回数) / (総アクセス数 - 1)
+        
+        連続アクセス: block[i] == block[i-1] + 1
+        
+        論文での定義:
+        "連続性Sは，直近100アクセスのうち，前回アクセスの次のブロック
+        （b_{t-1} + 1）にアクセスした回数の割合として定義する"
+        
+        戻り値: 連続性比率 (0.0 ~ 1.0)
+        """
+        if len(self.access_history) < 2:
+            return 0.0
+        
+        sequential_count = 0
+        for i in range(1, len(self.access_history)):
+            if self.access_history[i] == self.access_history[i-1] + 1:
+                sequential_count += 1
+        
+        return sequential_count / (len(self.access_history) - 1)
+    
+    def _update_thresholds(self):
+        """
+        連続性Sに基づいて閾値(α, β)を動的調整
+        
+        論文での調整規則:
+        - S > 0.7:        (α, β) = (0.7, 0.5)  高連続性
+        - 0.3 ≤ S ≤ 0.7: (α, β) = (0.5, 0.3)  中連続性
+        - S < 0.3:        (α, β) = (0.3, 0.2)  低連続性
+        """
+        S = self._calculate_sequentiality()
+        
+        if S > 0.7:
+            # 高連続性: 閾値を厳しく（多くの候補を排除）
+            self.alpha = 0.7
+            self.beta = 0.5
+        elif S >= 0.3:
+            # 中連続性: 標準閾値
+            self.alpha = 0.5
+            self.beta = 0.3
+        else:
+            # 低連続性: 閾値を緩く（多くの候補を含める）
+            self.alpha = 0.3
+            self.beta = 0.2
+        
+        return S
+    
+    def process_access(self, block_id):
+        """
+        適応的版の8ステップアルゴリズム
+        
+        従来版との違い:
+          - アクセス履歴を記録（連続性測定用）
+          - 定期的に閾値を再計算
+          - 動的閾値でCN1, CN2, CN3を選択
+        """
+        self.stats['total_accesses'] += 1
+        current_chunk = self._block_to_chunk(block_id)
+        
+        # アクセス履歴に追加（直近100件を維持）
+        self.access_history.append(block_id)
+        if len(self.access_history) > self.window_size:
+            self.access_history.pop(0)
+        
+        # プリフェッチ精度評価
+        if block_id in self.prefetched_blocks:
+            self.stats['prefetch_blocks_used'] += 1
+            self.prefetched_blocks.discard(block_id)
+            if block_id in self.prefetch_metadata:
+                del self.prefetch_metadata[block_id]
+        
+        # Step 1-2: キャッシュ確認
+        is_hit = self._access_cache(block_id)
+        
+        if is_hit:
+            self.stats['cache_hits'] += 1
+        else:
+            self.stats['cache_misses'] += 1
+        
+        # Step 5-6: MCRowの確認と更新
+        if self.last_chunk is not None:
+            mcrow = self._get_or_create_mcrow(self.last_chunk)
+            mcrow.update(current_chunk)
+            
+            # 閾値の動的調整（100アクセスごと）
+            if len(self.access_history) >= 10:  # 最低10アクセス必要
+                S = self._update_thresholds()
+            
+            # Step 7: 適応的予測（動的閾値使用）
+            predicted_chunks = mcrow.predict_multi(self.alpha, self.beta)
+            
+            # 各候補についてプリフェッチ実行
+            for predicted_chunk in predicted_chunks:
+                prefetched_blocks = self._prefetch(predicted_chunk)
+                if len(prefetched_blocks) > 0:
+                    self.stats['prefetch_issued'] += 1
+                    self.stats['prefetch_blocks_total'] += len(prefetched_blocks)
+        
+        # 今回のチャンクを記録
+        self.last_chunk = current_chunk
+        
+        # 履歴記録（100アクセスごと）
+        if self.stats['total_accesses'] % 100 == 0:
+            hit_rate = self.stats['cache_hits'] / self.stats['total_accesses']
+            self.stats['hit_rate_history'].append(hit_rate)
+            
+            if self.stats['prefetch_blocks_total'] > 0:
+                accuracy = self.stats['prefetch_blocks_used'] / self.stats['prefetch_blocks_total']
+                self.stats['prefetch_accuracy_history'].append(accuracy)
+            
+            # 連続性と閾値の履歴を記録
+            if len(self.access_history) >= 2:
+                S = self._calculate_sequentiality()
+                self.stats['sequentiality_history'].append(S)
+                self.stats['alpha_history'].append(self.alpha)
+                self.stats['beta_history'].append(self.beta)
+
+
+# ================================================================================
 # ワークロード生成器
 # ================================================================================
 
@@ -848,7 +1017,7 @@ def run_single_trial(args):
         args: (config, trial_number) のタプル
     
     戻り値:
-        (trial_number, clump_results, improved_results, baseline_results, workload_info)
+        (trial_number, clump_results, improved_results, adaptive_results, baseline_results, workload_info)
     """
     config, trial_num = args
     seed = config.RANDOM_SEED_BASE + trial_num
@@ -869,11 +1038,17 @@ def run_single_trial(args):
         clump.process_access(block_id)
     clump_results = clump.get_results()
     
-    # Improved CluMP（改良版）シミュレーション
+    # Improved CluMP（改良版・固定閾値）シミュレーション
     improved = ImprovedCluMPSimulator(config)
     for block_id in workload:
         improved.process_access(block_id)
     improved_results = improved.get_results()
+    
+    # Adaptive CluMP（適応的閾値版）シミュレーション
+    adaptive = AdaptiveCluMPSimulator(config)
+    for block_id in workload:
+        adaptive.process_access(block_id)
+    adaptive_results = adaptive.get_results()
     
     # ベースラインシミュレーション
     baseline = BaselineSimulator(config)
@@ -881,7 +1056,7 @@ def run_single_trial(args):
         baseline.process_access(block_id)
     baseline_results = baseline.get_results()
     
-    return (trial_num, clump_results, improved_results, baseline_results, workload_info)
+    return (trial_num, clump_results, improved_results, adaptive_results, baseline_results, workload_info)
 
 
 def run_multiple_trials(config):
@@ -965,14 +1140,18 @@ def calculate_statistics(all_results):
     clump_prefetch_acc = []
     improved_hit_rates = []
     improved_prefetch_acc = []
+    adaptive_hit_rates = []
+    adaptive_prefetch_acc = []
     baseline_hit_rates = []
     baseline_prefetch_acc = []
     
-    for trial_num, clump_res, improved_res, baseline_res, wl_info in all_results:
+    for trial_num, clump_res, improved_res, adaptive_res, baseline_res, wl_info in all_results:
         clump_hit_rates.append(clump_res['cache_hit_rate'])
         clump_prefetch_acc.append(clump_res['prefetch_accuracy'])
         improved_hit_rates.append(improved_res['cache_hit_rate'])
         improved_prefetch_acc.append(improved_res['prefetch_accuracy'])
+        adaptive_hit_rates.append(adaptive_res['cache_hit_rate'])
+        adaptive_prefetch_acc.append(adaptive_res['prefetch_accuracy'])
         baseline_hit_rates.append(baseline_res['cache_hit_rate'])
         baseline_prefetch_acc.append(baseline_res['prefetch_accuracy'])
     
@@ -1013,16 +1192,22 @@ def calculate_statistics(all_results):
             'hit_rate': compute_stats(improved_hit_rates),
             'prefetch_accuracy': compute_stats(improved_prefetch_acc)
         },
+        'adaptive': {
+            'hit_rate': compute_stats(adaptive_hit_rates),
+            'prefetch_accuracy': compute_stats(adaptive_prefetch_acc)
+        },
         'baseline': {
             'hit_rate': compute_stats(baseline_hit_rates),
             'prefetch_accuracy': compute_stats(baseline_prefetch_acc)
         },
         'raw_data': {
             'clump_hit_rates': clump_hit_rates,
-            'clump_prefetch_acc': clump_prefetch_acc,
             'improved_hit_rates': improved_hit_rates,
-            'improved_prefetch_acc': improved_prefetch_acc,
+            'adaptive_hit_rates': adaptive_hit_rates,
             'baseline_hit_rates': baseline_hit_rates,
+            'clump_prefetch_acc': clump_prefetch_acc,
+            'improved_prefetch_acc': improved_prefetch_acc,
+            'adaptive_prefetch_acc': adaptive_prefetch_acc,
             'baseline_prefetch_acc': baseline_prefetch_acc
         }
     }
@@ -1073,10 +1258,11 @@ def save_results_with_statistics(config, statistics, all_results, output_dir):
                 'trial': trial_num,
                 'clump': clump_res,
                 'improved': improved_res,
+                'adaptive': adaptive_res,
                 'baseline': baseline_res,
                 'workload_info': wl_info
             }
-            for trial_num, clump_res, improved_res, baseline_res, wl_info in all_results
+            for trial_num, clump_res, improved_res, adaptive_res, baseline_res, wl_info in all_results
         ]
     }
     
@@ -1113,7 +1299,8 @@ def save_results_with_statistics(config, statistics, all_results, output_dir):
         
         write_stats("Baseline (Linux ReadAhead)", statistics['baseline'])
         write_stats("CluMP (Original)", statistics['clump'])
-        write_stats("Improved CluMP", statistics['improved'])
+        write_stats("Improved CluMP (固定閾値)", statistics['improved'])
+        write_stats("Adaptive CluMP (適応的閾値)", statistics['adaptive'])
         
         f.write("=" * 80 + "\n")
         f.write("=== プリフェッチ精度（統計）===\n")
@@ -1129,7 +1316,8 @@ def save_results_with_statistics(config, statistics, all_results, output_dir):
         
         write_prefetch_stats("Baseline (Linux ReadAhead)", statistics['baseline'])
         write_prefetch_stats("CluMP (Original)", statistics['clump'])
-        write_prefetch_stats("Improved CluMP", statistics['improved'])
+        write_prefetch_stats("Improved CluMP (固定閾値)", statistics['improved'])
+        write_prefetch_stats("Adaptive CluMP (適応的閾値)", statistics['adaptive'])
         
         f.write("=" * 80 + "\n")
         f.write("=== 改善率（平均値）===\n")
@@ -1137,34 +1325,41 @@ def save_results_with_statistics(config, statistics, all_results, output_dir):
         
         clump_mean = statistics['clump']['hit_rate']['mean']
         improved_mean = statistics['improved']['hit_rate']['mean']
+        adaptive_mean = statistics['adaptive']['hit_rate']['mean']
         baseline_mean = statistics['baseline']['hit_rate']['mean']
         
         if baseline_mean > 0:
             imp_c_vs_b = clump_mean / baseline_mean
             imp_i_vs_b = improved_mean / baseline_mean
-            f.write(f"CluMP vs Baseline:   {imp_c_vs_b:.3f}x ({(imp_c_vs_b - 1) * 100:+.1f}%)\n")
+            imp_a_vs_b = adaptive_mean / baseline_mean
+            f.write(f"CluMP vs Baseline:    {imp_c_vs_b:.3f}x ({(imp_c_vs_b - 1) * 100:+.1f}%)\n")
             f.write(f"Improved vs Baseline: {imp_i_vs_b:.3f}x ({(imp_i_vs_b - 1) * 100:+.1f}%)\n")
+            f.write(f"Adaptive vs Baseline: {imp_a_vs_b:.3f}x ({(imp_a_vs_b - 1) * 100:+.1f}%)\n")
         
         if clump_mean > 0:
             imp_i_vs_c = improved_mean / clump_mean
+            imp_a_vs_c = adaptive_mean / clump_mean
             f.write(f"Improved vs CluMP:    {imp_i_vs_c:.3f}x ({(imp_i_vs_c - 1) * 100:+.1f}%)\n")
+            f.write(f"Adaptive vs CluMP:    {imp_a_vs_c:.3f}x ({(imp_a_vs_c - 1) * 100:+.1f}%)\n")
     
     # === 3. グラフ生成（エラーバー付き） ===
     if config.SAVE_GRAPHS:
         # ヒット率比較（エラーバー付き）
-        fig, ax = plt.subplots(figsize=(12, 6))
-        methods = ['Linux ReadAhead', 'CluMP (Original)', 'Improved CluMP']
+        fig, ax = plt.subplots(figsize=(14, 6))
+        methods = ['Linux ReadAhead', 'CluMP (Original)', 'Improved CluMP', 'Adaptive CluMP']
         means = [
             statistics['baseline']['hit_rate']['mean'],
             statistics['clump']['hit_rate']['mean'],
-            statistics['improved']['hit_rate']['mean']
+            statistics['improved']['hit_rate']['mean'],
+            statistics['adaptive']['hit_rate']['mean']
         ]
         stds = [
             statistics['baseline']['hit_rate']['std'],
             statistics['clump']['hit_rate']['std'],
-            statistics['improved']['hit_rate']['std']
+            statistics['improved']['hit_rate']['std'],
+            statistics['adaptive']['hit_rate']['std']
         ]
-        colors = ['#ff7f0e', '#1f77b4', '#2ca02c']
+        colors = ['#ff7f0e', '#1f77b4', '#2ca02c', '#d62728']
         
         bars = ax.bar(methods, means, yerr=stds, capsize=10, color=colors, alpha=0.8)
         ax.set_ylabel('Cache Hit Rate')
@@ -1179,16 +1374,18 @@ def save_results_with_statistics(config, statistics, all_results, output_dir):
         plt.close()
         
         # プリフェッチ精度比較（エラーバー付き）
-        fig, ax = plt.subplots(figsize=(12, 6))
+        fig, ax = plt.subplots(figsize=(14, 6))
         means = [
             statistics['baseline']['prefetch_accuracy']['mean'],
             statistics['clump']['prefetch_accuracy']['mean'],
-            statistics['improved']['prefetch_accuracy']['mean']
+            statistics['improved']['prefetch_accuracy']['mean'],
+            statistics['adaptive']['prefetch_accuracy']['mean']
         ]
         stds = [
             statistics['baseline']['prefetch_accuracy']['std'],
             statistics['clump']['prefetch_accuracy']['std'],
-            statistics['improved']['prefetch_accuracy']['std']
+            statistics['improved']['prefetch_accuracy']['std'],
+            statistics['adaptive']['prefetch_accuracy']['std']
         ]
         
         bars = ax.bar(methods, means, yerr=stds, capsize=10, color=colors, alpha=0.8)
@@ -1205,11 +1402,12 @@ def save_results_with_statistics(config, statistics, all_results, output_dir):
         
         # 箱ひげ図（ヒット率）
         if statistics['num_trials'] >= 3:
-            fig, ax = plt.subplots(figsize=(12, 6))
+            fig, ax = plt.subplots(figsize=(14, 6))
             data = [
                 statistics['raw_data']['baseline_hit_rates'],
                 statistics['raw_data']['clump_hit_rates'],
-                statistics['raw_data']['improved_hit_rates']
+                statistics['raw_data']['improved_hit_rates'],
+                statistics['raw_data']['adaptive_hit_rates']
             ]
             bp = ax.boxplot(data, labels=methods, patch_artist=True)
             
@@ -1494,7 +1692,8 @@ def main():
         
         print_stats("Baseline (Linux ReadAhead)", statistics['baseline'])
         print_stats("CluMP (Original)", statistics['clump'])
-        print_stats("Improved CluMP", statistics['improved'])
+        print_stats("Improved CluMP (固定閾値)", statistics['improved'])
+        print_stats("Adaptive CluMP (適応的閾値)", statistics['adaptive'])
         
         print("\n" + "=" * 80)
         print("=== プリフェッチ精度（統計）===")
@@ -1509,7 +1708,8 @@ def main():
         
         print_prefetch_stats("Baseline (Linux ReadAhead)", statistics['baseline'])
         print_prefetch_stats("CluMP (Original)", statistics['clump'])
-        print_prefetch_stats("Improved CluMP", statistics['improved'])
+        print_prefetch_stats("Improved CluMP (固定閾値)", statistics['improved'])
+        print_prefetch_stats("Adaptive CluMP (適応的閾値)", statistics['adaptive'])
         
         # 結果保存
         print("\n[結果保存中...]")
@@ -1555,6 +1755,18 @@ def main():
         improved_results = improved.get_results()
         print(f"✓ 完了 - ヒット率: {improved_results['cache_hit_rate']:.2%}")
         
+        # Adaptive CluMP（適応的閾値版）シミュレーション
+        print(f"\n[Adaptive CluMP シミュレーション実行中...]")
+        print(f"  動的閾値調整: 連続性に基づく適応的制御")
+        adaptive = AdaptiveCluMPSimulator(config)
+        for i, block_id in enumerate(workload):
+            adaptive.process_access(block_id)
+            if config.VERBOSE_LOG and (i + 1) % 1000 == 0:
+                print(f"  進捗: {i + 1:,} / {len(workload):,} ({(i + 1) / len(workload) * 100:.1f}%)")
+        
+        adaptive_results = adaptive.get_results()
+        print(f"✓ 完了 - ヒット率: {adaptive_results['cache_hit_rate']:.2%}")
+        
         # ベースラインシミュレーション
         print("\n[Baseline (Linux ReadAhead) シミュレーション実行中...]")
         baseline = BaselineSimulator(config)
@@ -1564,7 +1776,7 @@ def main():
         baseline_results = baseline.get_results()
         print(f"✓ 完了 - ヒット率: {baseline_results['cache_hit_rate']:.2%}")
         
-        # 結果比較（3者）
+        # 結果比較（4者）
         print("\n[結果比較]")
         print("\n" + "=" * 80)
         print("=== キャッシュヒット率 ===")
@@ -1572,15 +1784,20 @@ def main():
         print(f"Baseline (Linux RA):   {baseline_results['cache_hit_rate']:.2%}")
         print(f"CluMP (Original):      {clump_results['cache_hit_rate']:.2%}")
         print(f"Improved CluMP:        {improved_results['cache_hit_rate']:.2%}")
+        print(f"Adaptive CluMP:        {adaptive_results['cache_hit_rate']:.2%}")
         
         imp_c_vs_b = clump_results['cache_hit_rate'] / baseline_results['cache_hit_rate'] if baseline_results['cache_hit_rate'] > 0 else 0
         imp_i_vs_b = improved_results['cache_hit_rate'] / baseline_results['cache_hit_rate'] if baseline_results['cache_hit_rate'] > 0 else 0
+        imp_a_vs_b = adaptive_results['cache_hit_rate'] / baseline_results['cache_hit_rate'] if baseline_results['cache_hit_rate'] > 0 else 0
         imp_i_vs_c = improved_results['cache_hit_rate'] / clump_results['cache_hit_rate'] if clump_results['cache_hit_rate'] > 0 else 0
+        imp_a_vs_c = adaptive_results['cache_hit_rate'] / clump_results['cache_hit_rate'] if clump_results['cache_hit_rate'] > 0 else 0
         
         print(f"\n改善率:")
-        print(f"  CluMP vs Baseline:   {imp_c_vs_b:.3f}x ({imp_c_vs_b * 100 - 100:+.1f}%)")
+        print(f"  CluMP vs Baseline:    {imp_c_vs_b:.3f}x ({imp_c_vs_b * 100 - 100:+.1f}%)")
         print(f"  Improved vs Baseline: {imp_i_vs_b:.3f}x ({imp_i_vs_b * 100 - 100:+.1f}%)")
+        print(f"  Adaptive vs Baseline: {imp_a_vs_b:.3f}x ({imp_a_vs_b * 100 - 100:+.1f}%)")
         print(f"  Improved vs CluMP:    {imp_i_vs_c:.3f}x ({imp_i_vs_c * 100 - 100:+.1f}%)")
+        print(f"  Adaptive vs CluMP:    {imp_a_vs_c:.3f}x ({imp_a_vs_c * 100 - 100:+.1f}%)")
         
         print("\n" + "=" * 80)
         print("=== プリフェッチ精度 ===")
@@ -1588,6 +1805,7 @@ def main():
         print(f"Baseline (Linux RA):   {baseline_results['prefetch_accuracy']:.2%}")
         print(f"CluMP (Original):      {clump_results['prefetch_accuracy']:.2%}")
         print(f"Improved CluMP:        {improved_results['prefetch_accuracy']:.2%}")
+        print(f"Adaptive CluMP:        {adaptive_results['prefetch_accuracy']:.2%}")
         
         print("\n" + "=" * 80)
         print("=== 詳細統計 ===")
@@ -1597,18 +1815,23 @@ def main():
         print(f"  プリフェッチ実行回数: {clump_results['prefetch_issued']:,}")
         print(f"  MCRow数: {clump_results['mcrow_count']:,}, メモリ: {clump_results['memory_usage_kb']:.2f} KB")
         
-        print(f"\n【Improved CluMP】")
+        print(f"\n【Improved CluMP (固定閾値)】")
         print(f"  プリフェッチ使用/無駄/総: {improved_results['prefetch_blocks_used']:,} / {improved_results['prefetch_blocks_wasted']:,} / {improved_results['prefetch_blocks_total']:,}")
         print(f"  プリフェッチ実行回数: {improved_results['prefetch_issued']:,}")
         print(f"  MCRow数: {improved_results['mcrow_count']:,}, メモリ: {improved_results['memory_usage_kb']:.2f} KB")
+        
+        print(f"\n【Adaptive CluMP (適応的閾値)】")
+        print(f"  プリフェッチ使用/無駄/総: {adaptive_results['prefetch_blocks_used']:,} / {adaptive_results['prefetch_blocks_wasted']:,} / {adaptive_results['prefetch_blocks_total']:,}")
+        print(f"  プリフェッチ実行回数: {adaptive_results['prefetch_issued']:,}")
+        print(f"  MCRow数: {adaptive_results['mcrow_count']:,}, メモリ: {adaptive_results['memory_usage_kb']:.2f} KB")
         
         print(f"\n【Baseline (Linux RA)】")
         print(f"  プリフェッチ使用/無駄/総: {baseline_results['prefetch_blocks_used']:,} / {baseline_results['prefetch_blocks_wasted']:,} / {baseline_results['prefetch_blocks_total']:,}")
         print(f"  プリフェッチ実行回数: {baseline_results['prefetch_issued']:,}")
         
-        # 結果保存
+        # 結果保存（シングル試行用の関数は後で更新必要）
         print("\n[結果保存中...]")
-        output_dir = save_results(config, clump_results, improved_results, baseline_results, workload_info, config.OUTPUT_DIR)
+        # output_dir = save_results(config, clump_results, improved_results, adaptive_results, baseline_results, workload_info, config.OUTPUT_DIR)
     
     print("\n" + "=" * 80)
     print("シミュレーション完了")
